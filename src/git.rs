@@ -1,5 +1,5 @@
 use std::{
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
 };
@@ -113,6 +113,281 @@ pub struct DiffHunk {
     pub lines: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct CommitFile {
+    pub status: String,
+    pub path: String,
+}
+
+pub fn commit_files(repo: &Path, id: &str) -> Result<Vec<CommitFile>, String> {
+    let output = git_output(
+        Some(repo),
+        &[
+            "diff-tree",
+            "--root",
+            "--first-parent",
+            "--no-commit-id",
+            "--name-status",
+            "--no-renames",
+            "-r",
+            "-z",
+            id,
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let fields = output
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    let mut files = Vec::new();
+    for pair in fields.chunks_exact(2) {
+        files.push(CommitFile {
+            status: String::from_utf8_lossy(pair[0]).trim().to_owned(),
+            path: String::from_utf8_lossy(pair[1]).into_owned(),
+        });
+    }
+    Ok(files)
+}
+
+impl DiffHunk {
+    pub fn line_numbers(&self) -> Vec<(Option<usize>, Option<usize>)> {
+        let heading = self.heading.split("@@").nth(1).unwrap_or("").trim();
+        let mut fields = heading.split_whitespace();
+        let mut old = fields
+            .next()
+            .and_then(|s| s.strip_prefix('-'))
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut new = fields
+            .next()
+            .and_then(|s| s.strip_prefix('+'))
+            .and_then(|s| s.split(',').next())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        self.lines
+            .iter()
+            .map(|line| match line.as_bytes().first().copied() {
+                Some(b'-') => {
+                    let at = old;
+                    old += 1;
+                    (Some(at), None)
+                }
+                Some(b'+') => {
+                    let at = new;
+                    new += 1;
+                    (None, Some(at))
+                }
+                Some(b' ') => {
+                    let at = (Some(old), Some(new));
+                    old += 1;
+                    new += 1;
+                    at
+                }
+                _ => (None, None),
+            })
+            .collect()
+    }
+
+    pub fn line_patch(&self, index: usize) -> Option<String> {
+        let heading = self.heading.split("@@").nth(1)?.trim();
+        let mut fields = heading.split_whitespace();
+        let mut old = fields
+            .next()?
+            .strip_prefix('-')?
+            .split(',')
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        let mut new = fields
+            .next()?
+            .strip_prefix('+')?
+            .split(',')
+            .next()?
+            .parse::<usize>()
+            .ok()?;
+        let mut group_start = None;
+        let mut position = None;
+        for (i, line) in self.lines.iter().enumerate() {
+            let kind = line.as_bytes().first().copied();
+            if matches!(kind, Some(b'+') | Some(b'-')) && group_start.is_none() {
+                group_start = Some(old);
+            }
+            if i == index {
+                position = match kind {
+                    Some(b'+') => Some((group_start.unwrap_or(old).saturating_sub(1), 0, new, 1)),
+                    Some(b'-') => Some((old, 1, new.saturating_sub(1), 0)),
+                    _ => None,
+                };
+                break;
+            }
+            match kind {
+                Some(b' ') => {
+                    old += 1;
+                    new += 1;
+                    group_start = None;
+                }
+                Some(b'-') => old += 1,
+                Some(b'+') => new += 1,
+                _ => {}
+            }
+        }
+        let (old, old_count, new, new_count) = position?;
+        let header = self.patch.split("@@ ").next()?;
+        let mut patch = format!(
+            "{header}@@ -{old},{old_count} +{new},{new_count} @@\n{}\n",
+            self.lines[index]
+        );
+        if self
+            .lines
+            .get(index + 1)
+            .is_some_and(|line| line.starts_with("\\ No newline"))
+        {
+            patch.push_str("\\ No newline at end of file\n");
+        }
+        Some(patch)
+    }
+}
+
+#[derive(Clone)]
+pub struct ConflictBlock {
+    pub ours: Vec<String>,
+    pub theirs: Vec<String>,
+    pub selected_ours: Vec<bool>,
+    pub selected_theirs: Vec<bool>,
+    pub manual_result: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum ConflictPart {
+    Plain(String),
+    Block(ConflictBlock),
+}
+
+#[derive(Clone)]
+pub struct ConflictDocument {
+    pub path: String,
+    pub original: String,
+    pub parts: Vec<ConflictPart>,
+}
+
+impl ConflictDocument {
+    pub fn result(&self) -> String {
+        let mut result = String::new();
+        for part in &self.parts {
+            match part {
+                ConflictPart::Plain(text) => result.push_str(text),
+                ConflictPart::Block(block) => {
+                    if let Some(manual) = &block.manual_result {
+                        result.push_str(manual);
+                    } else {
+                        for (line, selected) in block.ours.iter().zip(&block.selected_ours) {
+                            if *selected {
+                                result.push_str(line);
+                            }
+                        }
+                        for (line, selected) in block.theirs.iter().zip(&block.selected_theirs) {
+                            if *selected {
+                                result.push_str(line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+pub fn parse_conflict(path: String, original: String) -> Result<ConflictDocument, String> {
+    let mut parts = Vec::new();
+    let mut plain = String::new();
+    let mut lines = original.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        if !line.starts_with("<<<<<<< ") {
+            plain.push_str(line);
+            continue;
+        }
+        if !plain.is_empty() {
+            parts.push(ConflictPart::Plain(std::mem::take(&mut plain)));
+        }
+        let mut ours = Vec::new();
+        let mut theirs = Vec::new();
+        let mut base = false;
+        let mut divider = false;
+        let mut closed = false;
+        for line in lines.by_ref() {
+            if line.starts_with("||||||| ") && !divider {
+                base = true;
+            } else if line.starts_with("=======") && !divider {
+                divider = true;
+                base = false;
+            } else if line.starts_with(">>>>>>> ") && divider {
+                closed = true;
+                break;
+            } else if !base && divider {
+                theirs.push(line.to_owned());
+            } else if !base {
+                ours.push(line.to_owned());
+            }
+        }
+        if !closed {
+            return Err(format!("Incomplete conflict markers in {path}"));
+        }
+        let selected_ours = vec![true; ours.len()];
+        let selected_theirs = vec![false; theirs.len()];
+        parts.push(ConflictPart::Block(ConflictBlock {
+            ours,
+            theirs,
+            selected_ours,
+            selected_theirs,
+            manual_result: None,
+        }));
+    }
+    if !plain.is_empty() {
+        parts.push(ConflictPart::Plain(plain));
+    }
+    if !parts
+        .iter()
+        .any(|part| matches!(part, ConflictPart::Block(_)))
+    {
+        return Err(format!("No text conflict markers found in {path}"));
+    }
+    Ok(ConflictDocument {
+        path,
+        original,
+        parts,
+    })
+}
+
+pub fn load_conflict(repo: &Path, path: &str) -> Result<ConflictDocument, String> {
+    let bytes = std::fs::read(repo.join(path)).map_err(|e| e.to_string())?;
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Err("Conflict file is larger than the 2 MB visual editor limit".into());
+    }
+    let original = String::from_utf8(bytes)
+        .map_err(|_| "Visual conflict editor requires UTF-8 text".to_owned())?;
+    parse_conflict(path.to_owned(), original)
+}
+
+pub fn save_conflict(repo: &Path, document: &ConflictDocument) -> Result<String, String> {
+    let path = repo.join(&document.path);
+    let current = std::fs::read(&path).map_err(|e| e.to_string())?;
+    if current != document.original.as_bytes() {
+        return Err("Conflict file changed on disk. Reopen the editor before saving.".into());
+    }
+    let result = document.result();
+    if contains_conflict_markers(result.as_bytes()) {
+        return Err("Conflict markers remain in the result".into());
+    }
+    std::fs::write(&path, result).map_err(|e| e.to_string())?;
+    run(repo, &["add", "--", &document.path])?;
+    Ok(format!("Resolved {} line by line", document.path))
+}
+
 pub fn diff_hunks(diff: &str) -> Vec<DiffHunk> {
     let lines: Vec<&str> = diff.lines().collect();
     let Some(first_hunk) = lines.iter().position(|line| line.starts_with("@@ ")) else {
@@ -153,10 +428,21 @@ pub fn diff_hunks(diff: &str) -> Vec<DiffHunk> {
 }
 
 pub fn apply_hunk(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    apply_patch(repo, patch, reverse, false)
+}
+
+pub fn apply_line(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    apply_patch(repo, patch, reverse, true)
+}
+
+fn apply_patch(repo: &Path, patch: &str, reverse: bool, zero_context: bool) -> Result<(), String> {
     let mut command = Command::new("git");
     command.arg("--no-pager").arg("-C").arg(repo).arg("apply");
     if reverse {
         command.arg("--reverse");
+    }
+    if zero_context {
+        command.arg("--unidiff-zero");
     }
     let mut child = command
         .args(["--cached", "--whitespace=nowarn", "-"])
@@ -338,29 +624,119 @@ fn commits(repo: &Path, limit: usize) -> Result<(Vec<Commit>, bool), String> {
             "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%P%x1e",
         ],
     )?;
-    let mut commits = Vec::new();
-    for record in text.split('\x1e') {
-        let fields: Vec<&str> = record.trim().split('\x1f').collect();
-        if fields.len() != 6 {
-            continue;
-        }
-        commits.push(Commit {
-            id: fields[0].to_owned(),
-            short: fields[1].to_owned(),
-            subject: fields[2].to_owned(),
-            author: fields[3].to_owned(),
-            date: fields[4].to_owned(),
-            parents: fields[5].split_whitespace().map(str::to_owned).collect(),
-            lane: 0,
-            lane_count: 1,
-            graph_edges: Vec::new(),
-            parent_edges: Vec::new(),
-        });
-    }
+    let mut commits = parse_commits(&text);
     let has_more = commits.len() > limit;
     commits.truncate(limit);
     assign_lanes(&mut commits);
     Ok((commits, has_more))
+}
+
+fn parse_commits(text: &str) -> Vec<Commit> {
+    text.split('\x1e')
+        .filter_map(|record| {
+            let fields: Vec<&str> = record.trim().split('\x1f').collect();
+            (fields.len() == 6).then(|| Commit {
+                id: fields[0].to_owned(),
+                short: fields[1].to_owned(),
+                subject: fields[2].to_owned(),
+                author: fields[3].to_owned(),
+                date: fields[4].to_owned(),
+                parents: fields[5].split_whitespace().map(str::to_owned).collect(),
+                lane: 0,
+                lane_count: 1,
+                graph_edges: Vec::new(),
+                parent_edges: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+pub fn search_history(repo: &Path, query: &str) -> Result<(Vec<Commit>, bool), String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    if run(repo, &["rev-parse", "--verify", "HEAD"]).is_err() {
+        return Ok((Vec::new(), false));
+    }
+    let mut child = Command::new("git")
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "log",
+            "--all",
+            "--topo-order",
+            "--date=short",
+            "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%P%x1e",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start Git: {e}"))?;
+    let stdout = child.stdout.take().ok_or("Could not read Git history")?;
+    let mut reader = BufReader::new(stdout);
+    let mut hits = Vec::new();
+    let mut has_more = false;
+    let mut record = Vec::new();
+    loop {
+        record.clear();
+        let read = reader
+            .read_until(b'\x1e', &mut record)
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        for commit in parse_commits(&String::from_utf8_lossy(&record)) {
+            if [
+                commit.id.as_str(),
+                commit.short.as_str(),
+                commit.subject.as_str(),
+                commit.author.as_str(),
+            ]
+            .iter()
+            .any(|field| field.to_lowercase().contains(&query))
+            {
+                if hits.len() == 300 {
+                    has_more = true;
+                    break;
+                }
+                hits.push(commit);
+            }
+        }
+        if has_more {
+            break;
+        }
+    }
+    drop(reader);
+    if has_more {
+        let _ = child.kill();
+        let _ = child.wait();
+    } else {
+        let output = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+    }
+    Ok((hits, has_more))
+}
+
+pub fn file_history(repo: &Path, path: &str) -> Result<Vec<Commit>, String> {
+    let text = run(
+        repo,
+        &[
+            "log",
+            "--follow",
+            "-n",
+            "100",
+            "--date=short",
+            "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%P%x1e",
+            "--",
+            path,
+        ],
+    )?;
+    Ok(parse_commits(&text))
 }
 
 fn assign_lanes(commits: &mut [Commit]) {
@@ -551,6 +927,26 @@ mod tests {
     }
 
     #[test]
+    fn graph_keeps_all_lanes_for_large_merges() {
+        let parents = (0..12).map(|n| format!("parent-{n}")).collect::<Vec<_>>();
+        let mut commits = vec![Commit {
+            id: "merge".into(),
+            short: "merge".into(),
+            subject: "merge".into(),
+            author: String::new(),
+            date: String::new(),
+            parents,
+            lane: 0,
+            lane_count: 0,
+            graph_edges: Vec::new(),
+            parent_edges: Vec::new(),
+        }];
+        assign_lanes(&mut commits);
+        assert_eq!(commits[0].lane_count, 12);
+        assert_eq!(commits[0].parent_edges, (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn snapshot_tracks_stage_commit_and_branch() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -658,6 +1054,140 @@ mod tests {
             run(&root, &["diff", "--cached", "--", "notes.txt"])
                 .unwrap()
                 .is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stages_and_unstages_individual_lines_in_one_hunk() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = init(
+            &std::env::temp_dir().join(format!("gitvibe-lines-{}-{unique}", std::process::id())),
+        )
+        .unwrap();
+        let file = root.join("notes.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        run(&root, &["add", "notes.txt"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Base",
+            ],
+        )
+        .unwrap();
+        std::fs::write(&file, "alpha\nnew one\nnew two\nbeta\ngamma\n").unwrap();
+        let diff = run(&root, &["diff", "--no-color", "--", "notes.txt"]).unwrap();
+        let hunk = diff_hunks(&diff).remove(0);
+        let index = hunk
+            .lines
+            .iter()
+            .position(|line| line == "+new one")
+            .unwrap();
+        apply_line(&root, &hunk.line_patch(index).unwrap(), false).unwrap();
+        let staged = run(&root, &["diff", "--cached", "--", "notes.txt"]).unwrap();
+        assert!(staged.contains("+new one"));
+        assert!(!staged.contains("+new two"));
+        let unstaged = run(&root, &["diff", "--", "notes.txt"]).unwrap();
+        assert!(unstaged.contains("+new two"));
+        let staged_hunk = diff_hunks(&staged).remove(0);
+        let index = staged_hunk
+            .lines
+            .iter()
+            .position(|line| line == "+new one")
+            .unwrap();
+        apply_line(&root, &staged_hunk.line_patch(index).unwrap(), true).unwrap();
+        assert!(
+            run(&root, &["diff", "--cached", "--", "notes.txt"])
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&file, "alpha\nBETA\ngamma\n").unwrap();
+        let diff = run(&root, &["diff", "--no-color", "--", "notes.txt"]).unwrap();
+        let hunk = diff_hunks(&diff).remove(0);
+        let index = hunk.lines.iter().position(|line| line == "+BETA").unwrap();
+        apply_line(&root, &hunk.line_patch(index).unwrap(), false).unwrap();
+        let index_text = run(&root, &["show", ":notes.txt"]).unwrap();
+        assert_eq!(index_text, "alpha\nBETA\nbeta\ngamma");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolves_conflict_lines_and_rejects_external_edits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = init(&std::env::temp_dir().join(format!(
+            "gitvibe-conflict-lines-{}-{unique}",
+            std::process::id()
+        )))
+        .unwrap();
+        let file = root.join("notes.txt");
+        let original = "before\n<<<<<<< HEAD\nours one\nours two\n=======\ntheirs one\n>>>>>>> feature\nafter\n";
+        std::fs::write(&file, original).unwrap();
+        let mut document = load_conflict(&root, "notes.txt").unwrap();
+        if let ConflictPart::Block(block) = &mut document.parts[1] {
+            block.selected_ours[1] = false;
+            block.selected_theirs[0] = true;
+        } else {
+            panic!("expected conflict block");
+        }
+        assert_eq!(document.result(), "before\nours one\ntheirs one\nafter\n");
+        std::fs::write(&file, "changed externally\n").unwrap();
+        assert!(save_conflict(&root, &document).is_err());
+        std::fs::write(&file, original).unwrap();
+        save_conflict(&root, &document).unwrap();
+        assert_eq!(
+            run(&root, &["show", ":notes.txt"]).unwrap(),
+            "before\nours one\ntheirs one\nafter"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn searches_full_history_and_lists_file_revisions() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = init(
+            &std::env::temp_dir().join(format!("gitvibe-search-{}-{unique}", std::process::id())),
+        )
+        .unwrap();
+        let file = root.join("notes.txt");
+        for i in 0..4 {
+            std::fs::write(&file, format!("version {i}\n")).unwrap();
+            run(&root, &["add", "notes.txt"]).unwrap();
+            run(
+                &root,
+                &[
+                    "-c",
+                    "user.name=GitVibe Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    &format!("milestone {i}"),
+                ],
+            )
+            .unwrap();
+        }
+        let (hits, more) = search_history(&root, "milestone 0").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(!more);
+        assert_eq!(file_history(&root, "notes.txt").unwrap().len(), 4);
+        assert_eq!(
+            commit_files(&root, &hits[0].id).unwrap()[0].path,
+            "notes.txt"
         );
         std::fs::remove_dir_all(root).unwrap();
     }

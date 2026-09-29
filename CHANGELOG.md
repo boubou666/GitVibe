@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-30
+
+### Added
+
+- Repository tabs with remembered open projects, a closable Changelog tab, and a full-width repository manager with favorites and search.
+- Aurora, Cosmic, and Ember themes, saved between launches.
+- Search across the complete history of all refs by commit message, author, or SHA, including commits beyond the loaded graph.
+- Structured file history with revision diffs and file previews, plus changed-file lists in the commit inspector.
+- Numbered diff lines with highlighted edits and individual line staging and unstaging.
+- A visual conflict editor for selecting lines from either side, editing the result, and staging the resolved file.
+
+### Changed
+
+- Reworked the workspace around a compact top action bar, branch and remote rail, dense uncapped graph, wide diff view, and a right-hand changes and commit panel.
+- Render graph lanes without the previous nine-lane limit, with horizontal scrolling for wide merge histories.
+- Tightened the desktop layout around flat repository tabs, a narrower branch rail, a graphite theme, aligned graph columns, compact change rows, and a docked Git console.
+- Select the newest commit when opening a repository so its details appear immediately.
+
 ## [0.5.0] - 2026-09-30
 
 ### Added
@@ -59,7 +77,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/boubou666/GitVibe/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/boubou666/GitVibe/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boubou666/GitVibe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boubou666/GitVibe/compare/v0.2.0...v0.3.0

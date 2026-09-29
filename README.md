@@ -1,25 +1,26 @@
 # GitVibe
 
-GitVibe is a native desktop Git client written in Rust for Windows, Linux, and macOS. Its vivid, layered interface pairs a visual repository view with the Git executable already installed on your computer. GitVibe is an independent project and is not affiliated with GitKraken.
+GitVibe is a native desktop Git client written in Rust for Windows, Linux, and macOS. Its compact three-pane workspace puts branches, the commit graph, and commit details side by side while using the Git executable already installed on your computer. GitVibe is an independent project and is not affiliated with GitKraken.
 
 ## Current features
 
 - Open, initialize, and clone repositories, including local and authenticated remote URLs.
-- Reopen recent repositories, restore window placement, and choose folders with native dialogs.
+- Keep multiple repositories open in tabs, pin favorites, search recent repositories, and restore window placement. The Changelog tab can be closed and reopened from the `+` menu.
+- Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
-- Inspect a colored commit graph with local and remote refs, load older commits in batches, search loaded history, view commit details, and compare any two commits.
-- Review working tree status and diffs; stage or unstage files and individual text hunks, discard edits, and commit changes.
-- Resolve merge conflicts file by file using Git's ours or theirs version, or edit a file externally and mark it resolved; complete or abort an in-progress merge.
-- Inspect file history and blame; view a commit patch or compare it with its first parent.
+- Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
+- Review numbered diffs with highlighted edits; stage or unstage files, individual text hunks, or lines; discard edits and commit changes.
+- Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
+- Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.
 - Cherry-pick and revert non-merge commits with confirmation.
 - Create and switch branches, track remote branches, merge branches, and create tags.
 - Delete merged local branches and local tags with confirmation; reset HEAD using soft, mixed, or hard mode.
 - Fetch, pull, and push using your normal Git credential helper.
 - Create, inspect, apply, and pop stashes.
-- Run any Git command from the integrated Git console. This is an argument parser, not a shell.
+- Run any Git command from a docked Git console while keeping the graph in view. This is an argument parser, not a shell.
 - Drag a repository folder onto the window to open it.
 
-The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search applies to the commits currently loaded. Hunk actions apply to text diffs; binary files and untracked files still use whole-file staging. Conflict choices apply to an entire file; use an external editor to combine lines from both sides. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The console is the way to access Git features without a dedicated screen yet, such as rebase, bisect, submodules, and worktrees. Commands needing a terminal editor or interactive stdin are not supported in the console yet.
+The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The console provides Git features without a dedicated screen yet, such as rebase, bisect, submodules, and worktrees. Commands needing a terminal editor or interactive stdin are not supported in the console yet.
 
 ## Download and run
 
@@ -62,7 +63,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes theme choices, true topology rendering for complex merge graphs, a visual line by line conflict editor, interactive rebase, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes an interactive rebase editor, worktree and submodule management, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 
