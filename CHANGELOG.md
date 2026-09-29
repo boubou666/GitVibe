@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
+### Added
+
+- Windows, Linux, and macOS (Apple Silicon and Intel) build, test, and package jobs.
+- Per-hunk staging and unstaging for text diffs.
+- File history, blame, commit patch and parent comparison views.
+- Confirmed cherry-pick and revert actions for non-merge commits.
+
+### Changed
+
+- Reworked the interface with a vivid dark palette, vector navigation icons, a denser graph with merge lines, staged and unstaged file groups, and a colored detail viewer.
+- Use Git's local clone mode for filesystem repositories.
+
 ## [0.1.0] - 2026-09-29
 
 ### Added
@@ -16,5 +30,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/boubou666/GitVibe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/boubou666/GitVibe/releases/tag/v0.1.0

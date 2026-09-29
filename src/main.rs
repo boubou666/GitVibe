@@ -5,8 +5,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("GitVibe")
-            .with_inner_size([1420.0, 900.0])
-            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size([1480.0, 920.0])
+            .with_min_inner_size([1120.0, 700.0])
             .with_icon(icon()),
         ..Default::default()
     };
