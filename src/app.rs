@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
 };
@@ -35,6 +35,19 @@ enum CommitAction {
     Revert,
 }
 
+#[derive(Clone)]
+enum RefDeletion {
+    Branch(String),
+    Tag(String),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ResetMode {
+    Soft,
+    Mixed,
+    Hard,
+}
+
 enum Job {
     Open(PathBuf),
     Init(PathBuf),
@@ -54,6 +67,7 @@ enum Done {
 
 pub struct GitVibe {
     repo: Option<PathBuf>,
+    recent_repos: Vec<PathBuf>,
     snapshot: Option<Snapshot>,
     page: Page,
     path_input: String,
@@ -64,6 +78,8 @@ pub struct GitVibe {
     commit_message: String,
     command_input: String,
     selected_commit: Option<String>,
+    compare_base: Option<String>,
+    history_limit: usize,
     selected_file: Option<String>,
     selected_file_staged: bool,
     detail: String,
@@ -76,6 +92,10 @@ pub struct GitVibe {
     show_clone: bool,
     confirm_discard: Option<String>,
     confirm_commit_action: Option<(CommitAction, String)>,
+    confirm_delete_ref: Option<RefDeletion>,
+    confirm_reset: Option<String>,
+    reset_mode: ResetMode,
+    reset_confirmation: String,
     committing: bool,
     hunk_action: bool,
 }
@@ -118,19 +138,27 @@ impl GitVibe {
             s.spacing.button_padding = egui::vec2(14.0, 8.0);
             s.spacing.interact_size.y = 32.0;
         });
-        let path = std::env::args()
+        let recent_repos = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Vec<PathBuf>>(storage, "recent_repos"))
+            .unwrap_or_default();
+        let path = std::env::args_os()
             .nth(1)
+            .map(PathBuf::from)
             .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
+                recent_repos
+                    .iter()
+                    .find(|path| git::discover(path).is_ok())
+                    .cloned()
             })
+            .or_else(|| std::env::current_dir().ok())
             .unwrap_or_default();
         let mut app = Self {
             repo: None,
+            recent_repos,
             snapshot: None,
             page: Page::History,
-            path_input: path.clone(),
+            path_input: path.to_string_lossy().into_owned(),
             clone_url: String::new(),
             clone_destination: String::new(),
             branch_input: String::new(),
@@ -138,6 +166,8 @@ impl GitVibe {
             commit_message: String::new(),
             command_input: String::new(),
             selected_commit: None,
+            compare_base: None,
+            history_limit: 300,
             selected_file: None,
             selected_file_staged: false,
             detail: String::new(),
@@ -150,17 +180,24 @@ impl GitVibe {
             show_clone: false,
             confirm_discard: None,
             confirm_commit_action: None,
+            confirm_delete_ref: None,
+            confirm_reset: None,
+            reset_mode: ResetMode::Mixed,
+            reset_confirmation: String::new(),
             committing: false,
             hunk_action: false,
         };
-        if git::discover(&PathBuf::from(&path)).is_ok() {
-            app.pending = Some(Job::Open(PathBuf::from(path)));
+        if git::discover(&path).is_ok() {
+            app.pending = Some(Job::Open(path));
         }
         app
     }
 
     fn queue(&mut self, job: Job) {
         if !self.busy {
+            if matches!(&job, Job::Open(_) | Job::Init(_) | Job::Clone(_, _)) {
+                self.history_limit = 300;
+            }
             self.pending = Some(job);
         }
     }
@@ -176,26 +213,30 @@ impl GitVibe {
             return;
         };
         let repo = self.repo.clone();
+        let history_limit = self.history_limit;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.busy = true;
         let ctx = ctx.clone();
         thread::spawn(move || {
             let result = match job {
-                Job::Open(path) => Done::Loaded(git::snapshot(&path)),
-                Job::Init(path) => Done::Loaded(git::init(&path).and_then(|p| git::snapshot(&p))),
-                Job::Clone(url, path) => {
-                    Done::Loaded(git::clone_repo(&url, &path).and_then(|p| git::snapshot(&p)))
-                }
+                Job::Open(path) => Done::Loaded(git::snapshot_with_limit(&path, history_limit)),
+                Job::Init(path) => Done::Loaded(
+                    git::init(&path).and_then(|p| git::snapshot_with_limit(&p, history_limit)),
+                ),
+                Job::Clone(url, path) => Done::Loaded(
+                    git::clone_repo(&url, &path)
+                        .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
+                ),
                 Job::Refresh => Done::Loaded(
                     repo.ok_or("No repository selected".to_owned())
-                        .and_then(|p| git::snapshot(&p)),
+                        .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
                 Job::Run(args) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| {
                             let output = git::run_owned(&p, &args)?;
-                            let snapshot = git::snapshot(&p)?;
+                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
                             Ok((output, snapshot))
                         }),
                 ),
@@ -216,7 +257,7 @@ impl GitVibe {
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| {
                             git::apply_hunk(&p, &patch, reverse)?;
-                            let snapshot = git::snapshot(&p)?;
+                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
                             Ok((
                                 if reverse {
                                     "Hunk unstaged".to_owned()
@@ -245,8 +286,17 @@ impl GitVibe {
         match done {
             Done::Loaded(result) => match result {
                 Ok(snapshot) => {
+                    if self.repo.as_ref() != Some(&snapshot.root) {
+                        self.selected_commit = None;
+                        self.selected_file = None;
+                        self.detail.clear();
+                        self.compare_base = None;
+                    }
                     self.repo = Some(snapshot.root.clone());
                     self.path_input = snapshot.root.to_string_lossy().into_owned();
+                    self.recent_repos.retain(|path| path != &snapshot.root);
+                    self.recent_repos.insert(0, snapshot.root.clone());
+                    self.recent_repos.truncate(8);
                     self.snapshot = Some(snapshot);
                     self.error.clear();
                 }
@@ -460,6 +510,12 @@ impl GitVibe {
                     if action(ui, "Open", true) {
                         self.queue(Job::Open(PathBuf::from(self.path_input.trim())));
                     }
+                    if action(ui, "Browse...", false)
+                        && let Some(path) = pick_folder(Some(Path::new(&self.path_input)))
+                    {
+                        self.path_input = path.to_string_lossy().into_owned();
+                        self.queue(Job::Open(path));
+                    }
                     if action(ui, "Initialize", false) {
                         self.queue(Job::Init(PathBuf::from(self.path_input.trim())));
                     }
@@ -468,6 +524,41 @@ impl GitVibe {
                     self.show_clone = true;
                 }
             });
+        if !self.recent_repos.is_empty() {
+            ui.add_space(15.0);
+            ui.label(
+                RichText::new("RECENT REPOSITORIES")
+                    .size(10.0)
+                    .strong()
+                    .color(MUTED),
+            );
+            for path in self.recent_repos.clone().into_iter().take(5) {
+                ui.horizontal(|ui| {
+                    let name = path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy();
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(name).size(11.5).color(TEXT))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        )
+                        .on_hover_text(path.to_string_lossy())
+                        .clicked()
+                    {
+                        self.queue(Job::Open(path.clone()));
+                    }
+                    if ui
+                        .small_button("x")
+                        .on_hover_text("Forget this repository")
+                        .clicked()
+                    {
+                        self.recent_repos.retain(|recent| recent != &path);
+                    }
+                });
+            }
+        }
         ui.add_space(22.0);
         if let Some(snapshot) = &self.snapshot {
             let branches = snapshot.branches.clone();
@@ -599,8 +690,19 @@ impl GitVibe {
         let refs = snapshot
             .branches
             .iter()
-            .chain(snapshot.tags.iter())
-            .map(|r| (r.target.clone(), r.name.clone()))
+            .map(|r| (r.target.clone(), r.name.clone(), ACCENT))
+            .chain(
+                snapshot
+                    .remote_branches
+                    .iter()
+                    .map(|r| (r.target.clone(), r.name.clone(), BLUE)),
+            )
+            .chain(
+                snapshot
+                    .tags
+                    .iter()
+                    .map(|r| (r.target.clone(), r.name.clone(), ORANGE)),
+            )
             .collect::<Vec<_>>();
         let commits = snapshot.commits.clone();
         let search = self.search.to_lowercase();
@@ -651,12 +753,16 @@ impl GitVibe {
                 ui.style_mut().spacing.item_spacing.y = 0.0;
                 for (row, commit) in visible.iter().enumerate() {
                     let selected = self.selected_commit.as_deref() == Some(&commit.id);
+                    let compare_base = self.compare_base.as_deref() == Some(&commit.id);
                     let response = paint_commit_row(
                         ui,
                         commit,
                         &refs,
                         row,
-                        selected,
+                        CommitRowStyle {
+                            selected,
+                            compare_base,
+                        },
                         graph_width,
                         search.is_empty(),
                     );
@@ -667,6 +773,16 @@ impl GitVibe {
                         "{}\n{} | {} | {}",
                         commit.subject, commit.short, commit.author, commit.date
                     ));
+                }
+                if snapshot.has_more_commits {
+                    ui.add_space(12.0);
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Load 300 more commits"))
+                        .clicked()
+                    {
+                        self.history_limit = self.history_limit.saturating_add(300);
+                        self.queue(Job::Refresh);
+                    }
                 }
             });
     }
@@ -917,6 +1033,8 @@ impl GitVibe {
             return;
         };
         let branches = snapshot.branches.clone();
+        let local_names = branches.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        let remote_branches = snapshot.remote_branches.clone();
         let tags = snapshot.tags.clone();
         egui::Frame::new()
             .fill(PANEL_ALT)
@@ -1005,6 +1123,10 @@ impl GitVibe {
                                                 branch.name.clone(),
                                             ]);
                                         }
+                                        if !branch.current && action(ui, "Delete...", false) {
+                                            self.confirm_delete_ref =
+                                                Some(RefDeletion::Branch(branch.name.clone()));
+                                        }
                                         if branch.current {
                                             badge(ui, "CURRENT", ACCENT);
                                         }
@@ -1034,11 +1156,48 @@ impl GitVibe {
                     }
                 });
                 for tag in tags {
-                    ui.label(
-                        RichText::new(format!("tag  {}    {}", tag.name, tag.target))
-                            .size(12.0)
-                            .color(TEXT),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("tag  {}    {}", tag.name, tag.target))
+                                .size(12.0)
+                                .color(TEXT),
+                        );
+                        if action(ui, "Delete...", false) {
+                            self.confirm_delete_ref = Some(RefDeletion::Tag(tag.name.clone()));
+                        }
+                    });
+                }
+                ui.add_space(15.0);
+                ui.label(
+                    RichText::new(format!("REMOTE BRANCHES  |  {}", remote_branches.len()))
+                        .size(11.0)
+                        .strong()
+                        .color(BLUE),
+                );
+                for remote in remote_branches {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&remote.name).size(12.0).color(TEXT));
+                        ui.label(
+                            RichText::new(&remote.target)
+                                .size(10.0)
+                                .monospace()
+                                .color(MUTED),
+                        );
+                        let local = remote.name.split_once('/').map(|(_, name)| name);
+                        let already_local = local.is_some_and(|name| {
+                            local_names.iter().any(|local_name| local_name == name)
+                        });
+                        if ui
+                            .add_enabled(!already_local && !self.busy, egui::Button::new("Track"))
+                            .clicked()
+                        {
+                            self.git_owned(vec![
+                                "switch".into(),
+                                "--track".into(),
+                                remote.name.clone(),
+                            ]);
+                        }
+                    });
                 }
             });
     }
@@ -1245,6 +1404,10 @@ impl GitVibe {
                                 .monospace()
                                 .color(ACCENT),
                         );
+                        if self.compare_base.as_deref() == Some(&commit.id) {
+                            ui.add_space(5.0);
+                            badge(ui, "COMPARE BASE", ORANGE);
+                        }
                     });
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!self.busy, |ui| {
@@ -1277,6 +1440,30 @@ impl GitVibe {
                                 self.confirm_commit_action =
                                     Some((CommitAction::Revert, commit.id.clone()));
                             }
+                        }
+                        if self.compare_base.as_deref() == Some(&commit.id) {
+                            if action(ui, "Clear base", false) {
+                                self.compare_base = None;
+                            }
+                        } else {
+                            if action(ui, "Set compare base", false) {
+                                self.compare_base = Some(commit.id.clone());
+                            }
+                            if let Some(base) = self.compare_base.clone()
+                                && action(ui, "Compare with base", false)
+                            {
+                                self.queue(Job::Inspect(vec![
+                                    "diff".into(),
+                                    "--no-color".into(),
+                                    base,
+                                    commit.id.clone(),
+                                ]));
+                            }
+                        }
+                        if action(ui, "Reset HEAD...", false) {
+                            self.confirm_reset = Some(commit.id.clone());
+                            self.reset_mode = ResetMode::Mixed;
+                            self.reset_confirmation.clear();
                         }
                     });
                 });
@@ -1455,6 +1642,17 @@ impl GitVibe {
                         egui::TextEdit::singleline(&mut self.clone_destination)
                             .desired_width(450.0),
                     );
+                    if action(ui, "Choose parent folder...", false)
+                        && let Some(parent) = pick_folder(
+                            Path::new(&self.clone_destination)
+                                .parent()
+                                .filter(|path| path.is_dir()),
+                        )
+                    {
+                        let name = git::default_clone_directory(&self.clone_url)
+                            .unwrap_or_else(|| "repository".to_owned());
+                        self.clone_destination = parent.join(name).to_string_lossy().into_owned();
+                    }
                     if ui
                         .add_enabled(
                             !self.clone_url.trim().is_empty()
@@ -1527,10 +1725,95 @@ impl GitVibe {
                     });
                 });
         }
+        if let Some(deletion) = self.confirm_delete_ref.clone() {
+            let (kind, name) = match &deletion {
+                RefDeletion::Branch(name) => ("branch", name),
+                RefDeletion::Tag(name) => ("tag", name),
+            };
+            egui::Window::new(format!("Delete {kind}?"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Delete local {kind} '{name}'?"));
+                    ui.label(match &deletion {
+                        RefDeletion::Branch(_) => {
+                            "Git will refuse to delete a branch with unmerged commits."
+                        }
+                        RefDeletion::Tag(_) => "This removes the local tag only.",
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete_ref = None;
+                        }
+                        if ui.add(egui::Button::new("Delete").fill(RED)).clicked() {
+                            let args = match &deletion {
+                                RefDeletion::Branch(_) => {
+                                    vec!["branch".into(), "-d".into(), "--".into(), name.clone()]
+                                }
+                                RefDeletion::Tag(_) => {
+                                    vec!["tag".into(), "-d".into(), "--".into(), name.clone()]
+                                }
+                            };
+                            self.git_owned(args);
+                            self.confirm_delete_ref = None;
+                        }
+                    });
+                });
+        }
+        if let Some(id) = self.confirm_reset.clone() {
+            egui::Window::new("Reset HEAD to commit?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Target commit: {}", &id[..id.len().min(12)]));
+                    ui.radio_value(&mut self.reset_mode, ResetMode::Soft, "Soft");
+                    ui.radio_value(&mut self.reset_mode, ResetMode::Mixed, "Mixed");
+                    ui.radio_value(&mut self.reset_mode, ResetMode::Hard, "Hard");
+                    ui.label(match self.reset_mode {
+                        ResetMode::Soft => "Moves HEAD; keeps staged and working changes.",
+                        ResetMode::Mixed => "Moves HEAD and unstages changes; keeps working files.",
+                        ResetMode::Hard => {
+                            "Moves HEAD and discards tracked staged and working changes."
+                        }
+                    });
+                    if self.reset_mode == ResetMode::Hard {
+                        ui.label("Type RESET to confirm the hard reset:");
+                        ui.add(egui::TextEdit::singleline(&mut self.reset_confirmation));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_reset = None;
+                            self.reset_confirmation.clear();
+                        }
+                        let enabled = !self.busy
+                            && (self.reset_mode != ResetMode::Hard
+                                || self.reset_confirmation == "RESET");
+                        if ui
+                            .add_enabled(enabled, egui::Button::new("Reset HEAD").fill(RED))
+                            .clicked()
+                        {
+                            let mode = match self.reset_mode {
+                                ResetMode::Soft => "--soft",
+                                ResetMode::Mixed => "--mixed",
+                                ResetMode::Hard => "--hard",
+                            };
+                            self.git_owned(vec!["reset".into(), mode.into(), id]);
+                            self.selected_commit = None;
+                            self.detail.clear();
+                            self.confirm_reset = None;
+                            self.reset_confirmation.clear();
+                        }
+                    });
+                });
+        }
     }
 }
 
 impl eframe::App for GitVibe {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, "recent_repos", &self.recent_repos);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
@@ -1591,7 +1874,11 @@ impl eframe::App for GitVibe {
                     .stroke(Stroke::new(1.0, BORDER))
                     .inner_margin(egui::Margin::same(16)),
             )
-            .show(ui, |ui| self.sidebar(ui));
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.sidebar(ui));
+            });
         egui::Panel::right("inspector")
             .resizable(true)
             .default_size(350.0)
@@ -1625,6 +1912,14 @@ fn lane_color(lane: usize) -> Color32 {
     [ACCENT, ORANGE, VIOLET, BLUE, RED][lane % 5]
 }
 
+fn pick_folder(start: Option<&Path>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    if let Some(path) = start.filter(|path| path.is_dir()) {
+        dialog = dialog.set_directory(path);
+    }
+    dialog.pick_folder()
+}
+
 fn diff_line(ui: &mut egui::Ui, line: &str) {
     let color = if line.starts_with("@@") || line.starts_with("diff --git") {
         VIOLET
@@ -1645,15 +1940,24 @@ fn diff_line(ui: &mut egui::Ui, line: &str) {
     );
 }
 
+struct CommitRowStyle {
+    selected: bool,
+    compare_base: bool,
+}
+
 fn paint_commit_row(
     ui: &mut egui::Ui,
     commit: &git::Commit,
-    refs: &[(String, String)],
+    refs: &[(String, String, Color32)],
     row: usize,
-    selected: bool,
+    style: CommitRowStyle,
     graph_width: f32,
     show_edges: bool,
 ) -> egui::Response {
+    let CommitRowStyle {
+        selected,
+        compare_base,
+    } = style;
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 29.0), egui::Sense::click());
     let painter = ui.painter();
@@ -1672,6 +1976,13 @@ fn paint_commit_row(
         [rect.left_bottom(), rect.right_bottom()],
         Stroke::new(0.5, BORDER),
     );
+    if compare_base {
+        painter.rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height())),
+            0.0,
+            ORANGE,
+        );
+    }
     if response.hovered() && !selected {
         painter.rect_filled(
             egui::Rect::from_min_size(rect.left_top(), egui::vec2(2.0, rect.height())),
@@ -1716,9 +2027,9 @@ fn paint_commit_row(
 
     let names = refs
         .iter()
-        .filter(|(target, _)| target == &commit.short)
+        .filter(|(target, _, _)| target == &commit.short)
         .collect::<Vec<_>>();
-    if let Some((_, name)) = names.first() {
+    if let Some((_, name, color)) = names.first() {
         let mut label = name.chars().take(13).collect::<String>();
         if names.len() > 1 {
             label.push_str(" +");
@@ -1732,7 +2043,7 @@ fn paint_commit_row(
         painter.rect_stroke(
             pill,
             3.0,
-            Stroke::new(1.0, lane_color(commit.lane)),
+            Stroke::new(1.0, *color),
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -1740,7 +2051,7 @@ fn paint_commit_row(
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(10.0),
-            lane_color(commit.lane),
+            *color,
         );
     }
 

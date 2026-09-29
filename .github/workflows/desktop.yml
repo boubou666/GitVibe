@@ -2,7 +2,7 @@ name: Desktop builds
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main]
     tags: ["v*"]
   pull_request:
 
@@ -73,8 +73,9 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
-          mkdir -p dist/GitVibe.app/Contents/MacOS
+          mkdir -p dist/GitVibe.app/Contents/MacOS dist/GitVibe.app/Contents/Resources
           cp target/release/gitvibe dist/GitVibe.app/Contents/MacOS/GitVibe
+          cp README.md LICENSE dist/GitVibe.app/Contents/Resources/
           cat > dist/GitVibe.app/Contents/Info.plist <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

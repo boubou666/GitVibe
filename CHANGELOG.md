@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-29
+
+### Added
+
+- Recent repositories and window placement persist between launches.
+- Native folder selection for opening repositories and choosing a clone destination parent.
+- Compare any two commits by setting a comparison base in the graph.
+- Load more commit history beyond the initial 300 rows, show remote branch badges, and track remote branches from the branch view.
+- Guarded deletion of local branches and tags, plus soft, mixed, and hard reset choices with an extra hard reset confirmation.
+
 ## [0.2.0] - 2026-09-29
 
 ### Added
@@ -30,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/boubou666/GitVibe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boubou666/GitVibe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/boubou666/GitVibe/releases/tag/v0.1.0
