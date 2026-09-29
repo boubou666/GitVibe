@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-09-30
+
+### Added
+
+- Per-user Windows installer with Start Menu shortcut, optional desktop shortcut, and uninstall support.
+- Update screen with automatic and manual checks against the latest GitHub release.
+- Verified package downloads using GitHub's SHA-256 release asset digest. On Windows, GitVibe opens the installer and closes; on Linux and macOS it opens the downloaded archive for replacement.
+
+### Changed
+
+- The repository is public and `main` requires pull requests and passing Windows, Linux, and both macOS checks.
+
 ## [0.4.0] - 2026-09-30
 
 ### Added
@@ -47,7 +59,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/boubou666/GitVibe/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boubou666/GitVibe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boubou666/GitVibe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boubou666/GitVibe/compare/v0.1.0...v0.2.0
