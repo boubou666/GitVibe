@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-30
+
+### Added
+
+- Show unresolved files in a dedicated conflict group, inspect their working copy, choose Git's ours or theirs version with confirmation, or mark an externally edited file resolved after checking for conflict markers.
+- Detect an in-progress merge, allow its merge commit even when choosing ours leaves no staged diff, and offer a confirmed merge abort.
+
 ## [0.3.0] - 2026-09-29
 
 ### Added
@@ -40,7 +47,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/boubou666/GitVibe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boubou666/GitVibe/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/boubou666/GitVibe/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/boubou666/GitVibe/releases/tag/v0.1.0

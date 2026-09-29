@@ -8,6 +8,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Reopen recent repositories, restore window placement, and choose folders with native dialogs.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search loaded history, view commit details, and compare any two commits.
 - Review working tree status and diffs; stage or unstage files and individual text hunks, discard edits, and commit changes.
+- Resolve merge conflicts file by file using Git's ours or theirs version, or edit a file externally and mark it resolved; complete or abort an in-progress merge.
 - Inspect file history and blame; view a commit patch or compare it with its first parent.
 - Cherry-pick and revert non-merge commits with confirmation.
 - Create and switch branches, track remote branches, merge branches, and create tags.
@@ -17,7 +18,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Run any Git command from the integrated Git console. This is an argument parser, not a shell.
 - Drag a repository folder onto the window to open it.
 
-The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search applies to the commits currently loaded. Hunk actions apply to text diffs; binary files and untracked files still use whole-file staging. The console is the way to access Git features without a dedicated screen yet, such as rebase, bisect, submodules, and worktrees. Commands needing a terminal editor or interactive stdin are not supported in the console yet.
+The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search applies to the commits currently loaded. Hunk actions apply to text diffs; binary files and untracked files still use whole-file staging. Conflict choices apply to an entire file; use an external editor to combine lines from both sides. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The console is the way to access Git features without a dedicated screen yet, such as rebase, bisect, submodules, and worktrees. Commands needing a terminal editor or interactive stdin are not supported in the console yet.
 
 ## Download and run
 
@@ -58,7 +59,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes theme choices, true topology rendering for complex merge graphs, conflict resolution, interactive rebase, remote hosting integrations, and signed installers.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes theme choices, true topology rendering for complex merge graphs, a visual line by line conflict editor, interactive rebase, remote hosting integrations, and signed installers.
 
 ## License
 

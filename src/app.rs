@@ -55,7 +55,10 @@ enum Job {
     Run(Vec<String>),
     Inspect(Vec<String>),
     InspectFile(String),
+    InspectConflict(String),
     ApplyHunk(String, bool),
+    ResolveConflict(String, git::ConflictSide),
+    MarkResolved(String),
     Refresh,
 }
 
@@ -94,10 +97,13 @@ pub struct GitVibe {
     confirm_commit_action: Option<(CommitAction, String)>,
     confirm_delete_ref: Option<RefDeletion>,
     confirm_reset: Option<String>,
+    confirm_conflict_side: Option<(String, git::ConflictSide)>,
+    confirm_abort_merge: bool,
     reset_mode: ResetMode,
     reset_confirmation: String,
     committing: bool,
     hunk_action: bool,
+    conflict_action: bool,
 }
 
 impl GitVibe {
@@ -182,10 +188,13 @@ impl GitVibe {
             confirm_commit_action: None,
             confirm_delete_ref: None,
             confirm_reset: None,
+            confirm_conflict_side: None,
+            confirm_abort_merge: false,
             reset_mode: ResetMode::Mixed,
             reset_confirmation: String::new(),
             committing: false,
             hunk_action: false,
+            conflict_action: false,
         };
         if git::discover(&path).is_ok() {
             app.pending = Some(Job::Open(path));
@@ -253,6 +262,21 @@ impl GitVibe {
                             Ok(format!("Untracked file: {path}\n\n{preview}"))
                         }),
                 ),
+                Job::InspectConflict(path) => Done::Inspected(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|p| {
+                            let file = p.join(&path);
+                            if !file.exists() {
+                                return Ok(format!(
+                                    "Conflict in {path}\n\nThe file is absent in the working tree. Choose a side or mark its deletion resolved."
+                                ));
+                            }
+                            let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+                            let preview =
+                                String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)]);
+                            Ok(format!("Conflict in {path}\n\n{preview}"))
+                        }),
+                ),
                 Job::ApplyHunk(patch, reverse) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| {
@@ -266,6 +290,22 @@ impl GitVibe {
                                 },
                                 snapshot,
                             ))
+                        }),
+                ),
+                Job::ResolveConflict(path, side) => Done::Ran(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|p| {
+                            let output = git::choose_conflict_side(&p, &path, side)?;
+                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
+                            Ok((output, snapshot))
+                        }),
+                ),
+                Job::MarkResolved(path) => Done::Ran(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|p| {
+                            let output = git::mark_conflict_resolved(&p, &path)?;
+                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
+                            Ok((output, snapshot))
                         }),
                 ),
             };
@@ -343,11 +383,17 @@ impl GitVibe {
                         }
                     }
                     self.hunk_action = false;
+                    if self.conflict_action {
+                        self.selected_file = None;
+                        self.detail.clear();
+                    }
+                    self.conflict_action = false;
                 }
                 Err(error) => {
                     self.error = error;
                     self.committing = false;
                     self.hunk_action = false;
+                    self.conflict_action = false;
                 }
             },
             Done::Inspected(result) => match result {
@@ -818,16 +864,39 @@ impl GitVibe {
         let unstaged: Vec<_> = snapshot
             .status
             .iter()
-            .filter(|f| f.unstaged())
+            .filter(|f| f.unstaged() && !f.conflicted())
             .cloned()
             .collect();
         let staged: Vec<_> = snapshot
             .status
             .iter()
-            .filter(|f| f.staged())
+            .filter(|f| f.staged() && !f.conflicted())
             .cloned()
             .collect();
-        if snapshot.status.is_empty() {
+        let conflicts: Vec<_> = snapshot
+            .status
+            .iter()
+            .filter(|f| f.conflicted())
+            .cloned()
+            .collect();
+        if snapshot.merge_in_progress {
+            egui::Frame::new()
+                .fill(PANEL_ALT)
+                .corner_radius(egui::CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, ORANGE))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        badge(ui, "MERGE IN PROGRESS", ORANGE);
+                        ui.label("Resolve every conflict, then create the merge commit.");
+                        if action(ui, "Abort merge...", false) {
+                            self.confirm_abort_merge = true;
+                        }
+                    });
+                });
+            ui.add_space(10.0);
+        }
+        if snapshot.status.is_empty() && !snapshot.merge_in_progress {
             egui::Frame::new()
                 .fill(PANEL)
                 .corner_radius(egui::CornerRadius::same(10))
@@ -847,6 +916,19 @@ impl GitVibe {
         egui::ScrollArea::vertical()
             .max_height(file_area_height)
             .show(ui, |ui| {
+                if !conflicts.is_empty() {
+                    ui.label(
+                        RichText::new(format!("CONFLICTS  |  {}", conflicts.len()))
+                            .size(11.0)
+                            .strong()
+                            .color(RED),
+                    );
+                    ui.add_space(4.0);
+                    for file in &conflicts {
+                        self.conflict_row(ui, file);
+                    }
+                    ui.add_space(16.0);
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(format!("UNSTAGED  |  {}", unstaged.len()))
@@ -855,9 +937,11 @@ impl GitVibe {
                             .color(ORANGE),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if action(ui, "Stage all", false) {
-                            self.git(&["add", "-A"]);
-                        }
+                        ui.add_enabled_ui(conflicts.is_empty(), |ui| {
+                            if action(ui, "Stage all", false) {
+                                self.git(&["add", "-A"]);
+                            }
+                        });
                     });
                 });
                 ui.add_space(4.0);
@@ -876,7 +960,7 @@ impl GitVibe {
                             .color(ACCENT),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if action(ui, "Unstage all", false) {
+                        if conflicts.is_empty() && action(ui, "Unstage all", false) {
                             if snapshot.commits.is_empty() {
                                 self.git(&["rm", "-r", "--cached", "--", "."]);
                             } else {
@@ -918,16 +1002,28 @@ impl GitVibe {
                 );
                 ui.horizontal(|ui| {
                     ui.label(
-                        RichText::new(format!("{} staged files", staged.len()))
-                            .size(11.0)
-                            .color(MUTED),
+                        RichText::new(if snapshot.merge_in_progress && staged.is_empty() {
+                            "Merge is ready to complete".to_owned()
+                        } else {
+                            format!("{} staged files", staged.len())
+                        })
+                        .size(11.0)
+                        .color(MUTED),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
-                                !self.commit_message.trim().is_empty() && !staged.is_empty(),
+                                !self.commit_message.trim().is_empty()
+                                    && (!staged.is_empty() || snapshot.merge_in_progress)
+                                    && conflicts.is_empty(),
                                 egui::Button::new(
-                                    RichText::new("Commit changes").strong().color(BG),
+                                    RichText::new(if snapshot.merge_in_progress {
+                                        "Complete merge"
+                                    } else {
+                                        "Commit changes"
+                                    })
+                                    .strong()
+                                    .color(BG),
                                 )
                                 .fill(ACCENT)
                                 .stroke(Stroke::NONE),
@@ -1013,6 +1109,47 @@ impl GitVibe {
                         }
                         if !staged && file.index != '?' && action(ui, "Discard...", false) {
                             self.confirm_discard = Some(file.path.clone());
+                        }
+                    });
+                });
+            });
+        ui.add_space(4.0);
+    }
+
+    fn conflict_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus) {
+        egui::Frame::new()
+            .fill(PANEL_ALT)
+            .corner_radius(egui::CornerRadius::same(8))
+            .stroke(Stroke::new(1.0, RED))
+            .inner_margin(egui::Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, "CONFLICT", RED);
+                    if ui
+                        .add(
+                            egui::Button::new(RichText::new(&file.path).size(12.0).color(TEXT))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        self.selected_file = Some(file.path.clone());
+                        self.selected_file_staged = false;
+                        self.selected_commit = None;
+                        self.queue(Job::InspectConflict(file.path.clone()));
+                    }
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        if action(ui, "Use ours...", false) {
+                            self.confirm_conflict_side =
+                                Some((file.path.clone(), git::ConflictSide::Ours));
+                        }
+                        if action(ui, "Use theirs...", false) {
+                            self.confirm_conflict_side =
+                                Some((file.path.clone(), git::ConflictSide::Theirs));
+                        }
+                        if action(ui, "Mark resolved", false) {
+                            self.conflict_action = true;
+                            self.queue(Job::MarkResolved(file.path.clone()));
                         }
                     });
                 });
@@ -1470,12 +1607,12 @@ impl GitVibe {
             }
         } else if let Some(path) = &self.selected_file {
             let path = path.clone();
-            let tracked = self.snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot
-                    .status
-                    .iter()
-                    .any(|file| file.path == path && file.index != '?')
-            });
+            let file_state = self
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.status.iter().find(|file| file.path == path));
+            let conflicted = file_state.is_some_and(git::FileStatus::conflicted);
+            let tracked = file_state.is_some_and(|file| file.index != '?' && !file.conflicted());
             egui::Frame::new()
                 .fill(ELEVATED)
                 .corner_radius(egui::CornerRadius::same(10))
@@ -1484,12 +1621,16 @@ impl GitVibe {
                 .show(ui, |ui| {
                     badge(
                         ui,
-                        if self.selected_file_staged {
+                        if conflicted {
+                            "CONFLICT"
+                        } else if self.selected_file_staged {
                             "STAGED"
                         } else {
                             "WORKING TREE"
                         },
-                        if self.selected_file_staged {
+                        if conflicted {
+                            RED
+                        } else if self.selected_file_staged {
                             ACCENT
                         } else {
                             ORANGE
@@ -1802,6 +1943,51 @@ impl GitVibe {
                             self.detail.clear();
                             self.confirm_reset = None;
                             self.reset_confirmation.clear();
+                        }
+                    });
+                });
+        }
+        if let Some((path, side)) = self.confirm_conflict_side.clone() {
+            let label = match side {
+                git::ConflictSide::Ours => "ours",
+                git::ConflictSide::Theirs => "theirs",
+            };
+            egui::Window::new(format!("Use {label} for this file?"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Replace {path} with Git's {label} version?"));
+                    ui.label("This overwrites the conflict file and stages the chosen version.");
+                    ui.label("During a rebase, Git's ours/theirs labels may feel reversed.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_conflict_side = None;
+                        }
+                        if ui
+                            .add(egui::Button::new(format!("Use {label}")).fill(RED))
+                            .clicked()
+                        {
+                            self.conflict_action = true;
+                            self.queue(Job::ResolveConflict(path, side));
+                            self.confirm_conflict_side = None;
+                        }
+                    });
+                });
+        }
+        if self.confirm_abort_merge {
+            egui::Window::new("Abort this merge?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Return to the state before this merge began?");
+                    ui.label("Conflict edits made during the merge may be lost.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_abort_merge = false;
+                        }
+                        if ui.add(egui::Button::new("Abort merge").fill(RED)).clicked() {
+                            self.git(&["merge", "--abort"]);
+                            self.confirm_abort_merge = false;
                         }
                     });
                 });
