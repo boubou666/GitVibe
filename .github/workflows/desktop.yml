@@ -1,0 +1,106 @@
+name: Desktop builds
+
+on:
+  push:
+    branches: [main, "feature/**"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stable Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add clippy rustfmt
+
+      - name: Linux desktop libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev libssl-dev libgl1-mesa-dev pkg-config
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release
+        run: cargo build --locked --release
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -LiteralPath target/release/gitvibe.exe,README.md,LICENSE -DestinationPath "dist/GitVibe-windows-${{ runner.arch }}.zip"
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/package
+          cp target/release/gitvibe README.md LICENSE dist/package/
+          tar -czf "dist/GitVibe-linux-${{ runner.arch }}.tar.gz" -C dist/package .
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          mkdir -p dist/GitVibe.app/Contents/MacOS
+          cp target/release/gitvibe dist/GitVibe.app/Contents/MacOS/GitVibe
+          cat > dist/GitVibe.app/Contents/Info.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleExecutable</key><string>GitVibe</string>
+            <key>CFBundleIdentifier</key><string>dev.gitvibe.app</string>
+            <key>CFBundleName</key><string>GitVibe</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          PLIST
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent GitVibe.app "GitVibe-macos-${{ runner.arch }}.zip"
+
+      - name: Upload desktop build
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVibe-${{ runner.os }}-${{ runner.arch }}
+          path: dist/GitVibe-*.zip
+          if-no-files-found: ignore
+
+      - name: Upload Linux build
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVibe-Linux-${{ runner.arch }}
+          path: dist/GitVibe-*.tar.gz

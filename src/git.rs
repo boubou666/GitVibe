@@ -41,6 +41,8 @@ pub struct Commit {
     pub parents: Vec<String>,
     pub lane: usize,
     pub lane_count: usize,
+    pub graph_edges: Vec<(usize, usize)>,
+    pub parent_edges: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -100,7 +102,13 @@ pub fn init(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn clone_repo(url: &str, destination: &Path) -> Result<PathBuf, String> {
-    let output = git_output(None, &["clone", "--", url, &destination.to_string_lossy()])?;
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let mut args = vec!["clone"];
+    if Path::new(url).exists() {
+        args.push("--local");
+    }
+    args.extend(["--", url, &destination_arg]);
+    let output = git_output(None, &args)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -198,6 +206,8 @@ fn commits(repo: &Path) -> Result<Vec<Commit>, String> {
             parents: fields[5].split_whitespace().map(str::to_owned).collect(),
             lane: 0,
             lane_count: 1,
+            graph_edges: Vec::new(),
+            parent_edges: Vec::new(),
         });
     }
     assign_lanes(&mut commits);
@@ -214,14 +224,31 @@ fn assign_lanes(commits: &mut [Commit]) {
                 active.push(commit.id.clone());
                 active.len() - 1
             });
+        let before = active.clone();
         commit.lane = lane;
-        commit.lane_count = active.len();
         active.remove(lane);
         for (offset, parent) in commit.parents.iter().enumerate() {
             if !active.contains(parent) {
                 active.insert((lane + offset).min(active.len()), parent.clone());
             }
         }
+        commit.lane_count = before.len().max(active.len());
+        commit.graph_edges = before
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| *id != &commit.id)
+            .filter_map(|(from, id)| {
+                active
+                    .iter()
+                    .position(|next| next == id)
+                    .map(|to| (from, to))
+            })
+            .collect();
+        commit.parent_edges = commit
+            .parents
+            .iter()
+            .filter_map(|id| active.iter().position(|next| next == id))
+            .collect();
     }
 }
 
@@ -329,6 +356,32 @@ mod tests {
     }
 
     #[test]
+    fn graph_tracks_merge_parent_lanes() {
+        let make = |id: &str, parents: &[&str]| Commit {
+            id: id.into(),
+            short: id.into(),
+            subject: id.into(),
+            author: String::new(),
+            date: String::new(),
+            parents: parents.iter().map(|id| (*id).into()).collect(),
+            lane: 0,
+            lane_count: 0,
+            graph_edges: Vec::new(),
+            parent_edges: Vec::new(),
+        };
+        let mut commits = vec![
+            make("merge", &["left", "right"]),
+            make("left", &["base"]),
+            make("right", &["base"]),
+            make("base", &[]),
+        ];
+        assign_lanes(&mut commits);
+        assert_eq!(commits[0].parent_edges.len(), 2);
+        assert_eq!(commits[0].lane_count, 2);
+        assert!(commits[1].graph_edges.iter().any(|(_, to)| *to == 1));
+    }
+
+    #[test]
     fn snapshot_tracks_stage_commit_and_branch() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -359,6 +412,10 @@ mod tests {
         let committed = snapshot(&root).unwrap();
         assert_eq!(committed.commits.len(), 1);
         assert!(committed.status.is_empty());
+        let clone_path = root.with_extension("cloned repository");
+        let cloned = clone_repo(&root.to_string_lossy(), &clone_path).unwrap();
+        assert_eq!(snapshot(&cloned).unwrap().commits.len(), 1);
+        std::fs::remove_dir_all(cloned).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

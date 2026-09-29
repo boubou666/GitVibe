@@ -16,7 +16,7 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. The comman
 1. Interactive rebase editor and merge tooling.
 2. Worktree and submodule management.
 3. GitHub, GitLab, and Bitbucket pull request workflows.
-4. Cross-platform packaging, signing, and update delivery.
+4. Signed installers, notarization, and update delivery for Windows, Linux, and macOS.
 5. Accessibility and keyboard navigation review.
 
 ## Architecture notes
