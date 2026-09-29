@@ -6,6 +6,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 
 - Open, initialize, and clone repositories, including local and authenticated remote URLs.
 - Reopen recent repositories, restore window placement, and choose folders with native dialogs.
+- Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search loaded history, view commit details, and compare any two commits.
 - Review working tree status and diffs; stage or unstage files and individual text hunks, discard edits, and commit changes.
 - Resolve merge conflicts file by file using Git's ours or theirs version, or edit a file externally and mark it resolved; complete or abort an in-progress merge.
@@ -22,11 +23,13 @@ The visual history initially loads the most recent 300 commits across local and 
 
 ## Download and run
 
-Git must be installed and available on `PATH` on every platform. The [Desktop builds workflow](.github/workflows/desktop.yml) compiles and tests Windows, Linux, and macOS builds and uploads a platform archive for each run. Linux folder dialogs use an XDG Desktop Portal backend or Zenity.
+Git must be installed and available on `PATH` on every platform. The [Desktop builds workflow](.github/workflows/desktop.yml) compiles and tests Windows, Linux, and macOS builds and uploads platform packages for each run. Linux folder dialogs use an XDG Desktop Portal backend or Zenity.
 
-- **Windows:** Extract the Windows archive and run `gitvibe.exe`.
+- **Windows:** Download `GitVibe-windows-X64-setup.exe` from the [latest release](https://github.com/boubou666/GitVibe/releases/latest). The per-user installer adds a Start Menu shortcut and an uninstaller without asking for administrator rights. A portable zip remains available.
 - **Linux:** Extract the Linux archive and run `./gitvibe`. A desktop session with X11 or Wayland and OpenGL support is required.
-- **macOS:** Choose the ARM64 archive for Apple Silicon or the X64 archive for Intel. Extract it and open `GitVibe.app`. The current build is unsigned; a signed and notarized distribution is future work.
+- **macOS:** Choose the ARM64 archive for Apple Silicon or the X64 archive for Intel. Extract it and open `GitVibe.app`.
+
+The Updates screen checks GitHub's latest published release automatically at startup and when you click **Check for updates**. Downloads are checked against the release asset's SHA-256 digest before they can be opened. On Windows, **Install update** starts the installer and closes GitVibe; finish the setup wizard to replace an existing installation. When updating from the portable zip, the installer creates a separate per-user installation, which you can then open from the Start Menu. On Linux and macOS, GitVibe opens the downloaded archive so you can replace the app manually. Current installers and macOS bundles are unsigned; Windows SmartScreen or macOS Gatekeeper may show a warning.
 
 ## Build from source
 
@@ -59,7 +62,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes theme choices, true topology rendering for complex merge graphs, a visual line by line conflict editor, interactive rebase, remote hosting integrations, and signed installers.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes theme choices, true topology rendering for complex merge graphs, a visual line by line conflict editor, interactive rebase, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

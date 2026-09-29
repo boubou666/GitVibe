@@ -62,6 +62,20 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -LiteralPath target/release/gitvibe.exe,README.md,LICENSE -DestinationPath "dist/GitVibe-windows-${{ runner.arch }}.zip"
 
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --version=6.7.1 --yes --no-progress
+
+      - name: Package Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          & $iscc "/DAppVersion=$version" 'installer/GitVibe.iss'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Package Linux
         if: runner.os == 'Linux'
         run: |
@@ -98,6 +112,14 @@ jobs:
           name: GitVibe-${{ runner.os }}-${{ runner.arch }}
           path: dist/GitVibe-*.zip
           if-no-files-found: ignore
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: GitVibe-Windows-${{ runner.arch }}-Installer
+          path: dist/GitVibe-*-setup.exe
+          if-no-files-found: error
 
       - name: Upload Linux build
         if: runner.os == 'Linux'

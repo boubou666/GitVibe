@@ -1,5 +1,6 @@
 mod app;
 mod git;
+mod updates;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

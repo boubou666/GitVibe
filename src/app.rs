@@ -4,7 +4,10 @@ use std::{
     thread,
 };
 
-use crate::git::{self, Snapshot};
+use crate::{
+    git::{self, Snapshot},
+    updates,
+};
 use eframe::egui::{self, Color32, RichText, Stroke};
 
 const BG: Color32 = Color32::from_rgb(10, 15, 24);
@@ -27,6 +30,22 @@ enum Page {
     Branches,
     Stashes,
     Console,
+    Updates,
+}
+
+#[derive(Clone)]
+enum UpdateState {
+    Checking,
+    UpToDate(String),
+    Available(updates::Release),
+    Downloading(updates::Release),
+    Ready(updates::Release, PathBuf),
+    Failed(String),
+}
+
+enum UpdateDone {
+    Checked(Result<updates::Check, String>),
+    Downloaded(updates::Release, Result<PathBuf, String>),
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +123,8 @@ pub struct GitVibe {
     committing: bool,
     hunk_action: bool,
     conflict_action: bool,
+    update_state: UpdateState,
+    update_receiver: Option<Receiver<UpdateDone>>,
 }
 
 impl GitVibe {
@@ -195,11 +216,59 @@ impl GitVibe {
             committing: false,
             hunk_action: false,
             conflict_action: false,
+            update_state: UpdateState::Checking,
+            update_receiver: None,
         };
         if git::discover(&path).is_ok() {
             app.pending = Some(Job::Open(path));
         }
+        app.check_updates(&cc.egui_ctx);
         app
+    }
+
+    fn check_updates(&mut self, ctx: &egui::Context) {
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        self.update_state = UpdateState::Checking;
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let _ = sender.send(UpdateDone::Checked(updates::check_latest()));
+            ctx.request_repaint();
+        });
+    }
+
+    fn download_update(&mut self, ctx: &egui::Context, release: updates::Release) {
+        let (sender, receiver) = mpsc::channel();
+        self.update_receiver = Some(receiver);
+        self.update_state = UpdateState::Downloading(release.clone());
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = updates::download(&release);
+            let _ = sender.send(UpdateDone::Downloaded(release, result));
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_updates(&mut self) {
+        let Some(receiver) = &self.update_receiver else {
+            return;
+        };
+        let Ok(done) = receiver.try_recv() else {
+            return;
+        };
+        self.update_receiver = None;
+        self.update_state = match done {
+            UpdateDone::Checked(Ok(updates::Check::UpToDate(latest))) => {
+                UpdateState::UpToDate(latest)
+            }
+            UpdateDone::Checked(Ok(updates::Check::Available(release))) => {
+                UpdateState::Available(release)
+            }
+            UpdateDone::Checked(Err(error)) | UpdateDone::Downloaded(_, Err(error)) => {
+                UpdateState::Failed(error)
+            }
+            UpdateDone::Downloaded(release, Ok(path)) => UpdateState::Ready(release, path),
+        };
     }
 
     fn queue(&mut self, job: Job) {
@@ -495,10 +564,18 @@ impl GitVibe {
             (Page::Branches, "Branches & tags"),
             (Page::Stashes, "Stashes"),
             (Page::Console, "Git console"),
+            (Page::Updates, "Updates"),
         ] {
             let selected = self.page == page;
             let label = if page == Page::Changes && changed > 0 {
                 format!("{title}  ({changed})")
+            } else if page == Page::Updates
+                && matches!(
+                    self.update_state,
+                    UpdateState::Available(_) | UpdateState::Ready(_, _)
+                )
+            {
+                format!("{title}  (new)")
             } else {
                 title.to_owned()
             };
@@ -1504,6 +1581,122 @@ impl GitVibe {
         });
     }
 
+    fn updates_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "STAY IN FLOW",
+            "Updates",
+            "Get the latest GitVibe release from GitHub.",
+        );
+        ui.add_space(16.0);
+        egui::Frame::new()
+            .fill(PANEL)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, BORDER))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    badge(ui, &format!("INSTALLED  v{}", env!("CARGO_PKG_VERSION")), ACCENT);
+                    if !matches!(
+                        self.update_state,
+                        UpdateState::Checking | UpdateState::Downloading(_)
+                    ) && action(ui, "Check for updates", false)
+                    {
+                        self.check_updates(ui.ctx());
+                    }
+                });
+                ui.add_space(14.0);
+                match self.update_state.clone() {
+                    UpdateState::Checking => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Checking GitHub Releases...");
+                        });
+                    }
+                    UpdateState::UpToDate(latest) => {
+                        ui.label(
+                            RichText::new("You're up to date.").size(17.0).strong().color(ACCENT),
+                        );
+                        ui.label(format!("Latest published release: {latest}"));
+                    }
+                    UpdateState::Available(release) => {
+                        ui.label(
+                            RichText::new(format!("{} is ready", release.version))
+                                .size(19.0)
+                                .strong()
+                                .color(ORANGE),
+                        );
+                        ui.add_space(6.0);
+                        if action(
+                            ui,
+                            if cfg!(target_os = "windows") {
+                                "Download installer"
+                            } else {
+                                "Download update"
+                            },
+                            true,
+                        ) {
+                            self.download_update(ui.ctx(), release.clone());
+                        }
+                        ui.hyperlink_to("View release on GitHub", &release.page_url);
+                        if !release.notes.is_empty() {
+                            ui.add_space(10.0);
+                            ui.label(RichText::new("RELEASE NOTES").size(10.0).strong().color(MUTED));
+                            egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                ui.label(&release.notes);
+                            });
+                        }
+                    }
+                    UpdateState::Downloading(release) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(format!("Downloading and verifying {}...", release.version));
+                        });
+                    }
+                    UpdateState::Ready(release, path) => {
+                        ui.label(
+                            RichText::new(format!("{} downloaded and verified", release.version))
+                                .size(17.0)
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.label(RichText::new(path.display().to_string()).monospace().color(MUTED));
+                        ui.add_space(8.0);
+                        if cfg!(target_os = "windows") {
+                            ui.label("The installer will open and GitVibe will close. It installs or updates your per-user copy. If you run the portable zip, launch the installed copy from the Start Menu afterward.");
+                        } else {
+                            ui.label("Open the archive, then replace your installed GitVibe app with the new version.");
+                        }
+                        if action(
+                            ui,
+                            if cfg!(target_os = "windows") {
+                                "Install update"
+                            } else {
+                                "Open downloaded archive"
+                            },
+                            true,
+                        ) {
+                            match updates::open_download(&path) {
+                                Ok(()) if cfg!(target_os = "windows") => {
+                                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                                Ok(()) => {}
+                                Err(error) => self.update_state = UpdateState::Failed(error),
+                            }
+                        }
+                    }
+                    UpdateState::Failed(error) => {
+                        ui.label(RichText::new("Update check failed").size(17.0).color(RED));
+                        ui.label(error);
+                        ui.hyperlink_to(
+                            "Open GitVibe releases",
+                            "https://github.com/boubou666/GitVibe/releases",
+                        );
+                    }
+                }
+            });
+    }
+
     fn inspector(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.label(RichText::new("DETAILS").size(10.0).strong().color(ACCENT));
@@ -2003,6 +2196,7 @@ impl eframe::App for GitVibe {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.poll_updates();
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -2088,6 +2282,7 @@ impl eframe::App for GitVibe {
                 Page::Branches => self.branches(ui),
                 Page::Stashes => self.stashes(ui),
                 Page::Console => self.console(ui),
+                Page::Updates => self.updates_page(ui),
             });
         self.dialogs(&ctx);
         self.launch(&ctx);
@@ -2415,6 +2610,27 @@ fn nav_icon(ui: &mut egui::Ui, page: Page, color: Color32) {
                 [
                     egui::pos2(x + 10.0, y + 14.0),
                     egui::pos2(x + 16.0, y + 14.0),
+                ],
+                stroke,
+            );
+        }
+        Page::Updates => {
+            painter.line_segment(
+                [egui::pos2(x + 9.0, y + 2.0), egui::pos2(x + 9.0, y + 12.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(x + 5.0, y + 8.0), egui::pos2(x + 9.0, y + 12.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [egui::pos2(x + 13.0, y + 8.0), egui::pos2(x + 9.0, y + 12.0)],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(x + 3.0, y + 16.0),
+                    egui::pos2(x + 15.0, y + 16.0),
                 ],
                 stroke,
             );
