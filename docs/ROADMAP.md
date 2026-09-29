@@ -7,7 +7,7 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. The comman
 1. Add theme choices and improve recent repository management.
 2. Improve topology rendering for complex merge graphs and add a global history search. Remote branch badges and commit pagination are in place.
 3. Add richer diff rendering and file history beyond the current text view.
-4. Add a conflict resolver and per-line staging.
+4. Add a visual line by line conflict editor and per-line staging. Whole-file conflict choices and per-hunk staging are in place.
 
 ## Later
 

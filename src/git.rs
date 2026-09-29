@@ -16,6 +16,7 @@ pub struct Snapshot {
     pub tags: Vec<Ref>,
     pub remotes: Vec<String>,
     pub stashes: Vec<String>,
+    pub merge_in_progress: bool,
 }
 
 #[derive(Clone)]
@@ -32,6 +33,57 @@ impl FileStatus {
     pub fn unstaged(&self) -> bool {
         self.worktree != ' ' || self.index == '?'
     }
+
+    pub fn conflicted(&self) -> bool {
+        matches!(
+            (self.index, self.worktree),
+            ('D', 'D')
+                | ('A', 'U')
+                | ('U', 'D')
+                | ('U', 'A')
+                | ('D', 'U')
+                | ('A', 'A')
+                | ('U', 'U')
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ConflictSide {
+    Ours,
+    Theirs,
+}
+
+pub fn choose_conflict_side(repo: &Path, path: &str, side: ConflictSide) -> Result<String, String> {
+    let flag = match side {
+        ConflictSide::Ours => "--ours",
+        ConflictSide::Theirs => "--theirs",
+    };
+    run(repo, &["checkout", flag, "--", path])?;
+    run(repo, &["add", "-A", "--", path])?;
+    Ok(format!("Resolved {path} with {}", &flag[2..]))
+}
+
+pub fn mark_conflict_resolved(repo: &Path, path: &str) -> Result<String, String> {
+    let file = repo.join(path);
+    if file.exists() {
+        let bytes = std::fs::read(&file).map_err(|e| e.to_string())?;
+        if contains_conflict_markers(&bytes) {
+            return Err(format!(
+                "Conflict markers remain in {path}. Remove them before marking the file resolved."
+            ));
+        }
+    }
+    run(repo, &["add", "-A", "--", path])?;
+    Ok(format!("Marked {path} resolved"))
+}
+
+fn contains_conflict_markers(bytes: &[u8]) -> bool {
+    bytes.split(|byte| *byte == b'\n').any(|line| {
+        line.starts_with(b"<<<<<<< ")
+            || line.starts_with(b"=======")
+            || line.starts_with(b">>>>>>> ")
+    })
 }
 
 #[derive(Clone)]
@@ -220,6 +272,7 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
         .lines()
         .map(str::to_owned)
         .collect();
+    let merge_in_progress = run(&root, &["rev-parse", "--verify", "-q", "MERGE_HEAD"]).is_ok();
     Ok(Snapshot {
         root,
         branch,
@@ -231,6 +284,7 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
         tags,
         remotes,
         stashes,
+        merge_in_progress,
     })
 }
 
@@ -640,6 +694,81 @@ mod tests {
         assert!(!snapshot.branches.iter().any(|r| r.name == "old-branch"));
         assert!(!snapshot.tags.iter().any(|r| r.name == "old-tag"));
         assert!(snapshot.branches.iter().any(|r| r.current));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_conflict_and_resolves_chosen_side() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-conflict-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        let file = root.join("shared.txt");
+        let commit = |message: &str| {
+            run(&root, &["add", "--", "shared.txt"]).unwrap();
+            run(
+                &root,
+                &[
+                    "-c",
+                    "user.name=GitVibe Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    message,
+                ],
+            )
+            .unwrap();
+        };
+        std::fs::write(&file, "base\n").unwrap();
+        commit("Base");
+        let initial_branch = run(&root, &["branch", "--show-current"]).unwrap();
+        run(&root, &["switch", "-c", "topic"]).unwrap();
+        std::fs::write(&file, "topic change\n").unwrap();
+        commit("Topic");
+        run(&root, &["switch", &initial_branch]).unwrap();
+        std::fs::write(&file, "current change\n").unwrap();
+        commit("Current");
+        let merge = run(&root, &["merge", "topic"]);
+        assert!(merge.is_err(), "Expected a merge conflict, got {merge:?}");
+        let conflicted = snapshot(&root).unwrap();
+        assert!(
+            conflicted.status.iter().any(FileStatus::conflicted),
+            "Merge failed without an unmerged file: {merge:?}"
+        );
+        assert!(mark_conflict_resolved(&root, "shared.txt").is_err());
+        choose_conflict_side(&root, "shared.txt", ConflictSide::Ours).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().trim(),
+            "current change"
+        );
+        let resolved = snapshot(&root).unwrap();
+        assert!(!resolved.status.iter().any(FileStatus::conflicted));
+        assert!(resolved.merge_in_progress);
+        assert!(resolved.status.is_empty());
+        run(&root, &["merge", "--abort"]).unwrap();
+        assert!(!snapshot(&root).unwrap().merge_in_progress);
+        assert!(run(&root, &["merge", "topic"]).is_err());
+        choose_conflict_side(&root, "shared.txt", ConflictSide::Theirs).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().trim(),
+            "topic change"
+        );
+        let resolved = snapshot(&root).unwrap();
+        assert!(!resolved.status.iter().any(FileStatus::conflicted));
+        assert!(resolved.status.iter().any(FileStatus::staged));
+        run(&root, &["merge", "--abort"]).unwrap();
+        assert!(run(&root, &["merge", "topic"]).is_err());
+        std::fs::write(&file, "combined change\n").unwrap();
+        mark_conflict_resolved(&root, "shared.txt").unwrap();
+        let resolved = snapshot(&root).unwrap();
+        assert!(!resolved.status.iter().any(FileStatus::conflicted));
+        assert!(resolved.status.iter().any(FileStatus::staged));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
