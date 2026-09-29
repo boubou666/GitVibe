@@ -23,7 +23,7 @@ Git must be installed and available on `PATH` on every platform. The [Desktop bu
 
 - **Windows:** Extract the Windows archive and run `gitvibe.exe`.
 - **Linux:** Extract the Linux archive and run `./gitvibe`. A desktop session with X11 or Wayland and OpenGL support is required.
-- **macOS:** Extract the macOS archive and open `GitVibe.app`. The current build is unsigned; a signed and notarized distribution is future work.
+- **macOS:** Choose the ARM64 archive for Apple Silicon or the X64 archive for Intel. Extract it and open `GitVibe.app`. The current build is unsigned; a signed and notarized distribution is future work.
 
 ## Build from source
 

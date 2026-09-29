@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Windows, Linux, and macOS build, test, and package jobs.
+- Windows, Linux, and macOS (Apple Silicon and Intel) build, test, and package jobs.
 - Per-hunk staging and unstaging for text diffs.
 - File history, blame, commit patch and parent comparison views.
 - Confirmed cherry-pick and revert actions for non-merge commits.
