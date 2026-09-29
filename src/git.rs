@@ -10,7 +10,9 @@ pub struct Snapshot {
     pub branch: String,
     pub status: Vec<FileStatus>,
     pub commits: Vec<Commit>,
+    pub has_more_commits: bool,
     pub branches: Vec<Ref>,
+    pub remote_branches: Vec<Ref>,
     pub tags: Vec<Ref>,
     pub remotes: Vec<String>,
     pub stashes: Vec<String>,
@@ -188,12 +190,27 @@ pub fn clone_repo(url: &str, destination: &Path) -> Result<PathBuf, String> {
     discover(destination)
 }
 
-pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
+pub fn default_clone_directory(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches(['/', '\\']);
+    let final_part = trimmed.rsplit(['/', '\\', ':']).next()?;
+    let name = final_part.strip_suffix(".git").unwrap_or(final_part);
+    if name.is_empty() || name == "." || name == ".." {
+        None
+    } else {
+        Some(name.to_owned())
+    }
+}
+
+pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String> {
     let root = discover(repo)?;
     let branch = run(&root, &["branch", "--show-current"])?;
     let status = status(&root)?;
-    let commits = commits(&root)?;
+    let (commits, has_more_commits) = commits(&root, limit)?;
     let branches = refs(&root, "refs/heads")?;
+    let remote_branches = refs(&root, "refs/remotes")?
+        .into_iter()
+        .filter(|r| !r.name.ends_with("/HEAD"))
+        .collect();
     let tags = refs(&root, "refs/tags")?;
     let remotes = run(&root, &["remote"])?
         .lines()
@@ -208,7 +225,9 @@ pub fn snapshot(repo: &Path) -> Result<Snapshot, String> {
         branch,
         status,
         commits,
+        has_more_commits,
         branches,
+        remote_branches,
         tags,
         remotes,
         stashes,
@@ -248,10 +267,11 @@ fn parse_status(bytes: &[u8]) -> Result<Vec<FileStatus>, String> {
     Ok(files)
 }
 
-fn commits(repo: &Path) -> Result<Vec<Commit>, String> {
+fn commits(repo: &Path, limit: usize) -> Result<(Vec<Commit>, bool), String> {
     if run(repo, &["rev-parse", "--verify", "HEAD"]).is_err() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     }
+    let count = limit.saturating_add(1).to_string();
     let text = run(
         repo,
         &[
@@ -259,7 +279,7 @@ fn commits(repo: &Path) -> Result<Vec<Commit>, String> {
             "--all",
             "--topo-order",
             "-n",
-            "300",
+            &count,
             "--date=short",
             "--pretty=format:%H%x1f%h%x1f%s%x1f%an%x1f%ad%x1f%P%x1e",
         ],
@@ -283,8 +303,10 @@ fn commits(repo: &Path) -> Result<Vec<Commit>, String> {
             parent_edges: Vec::new(),
         });
     }
+    let has_more = commits.len() > limit;
+    commits.truncate(limit);
     assign_lanes(&mut commits);
-    Ok(commits)
+    Ok((commits, has_more))
 }
 
 fn assign_lanes(commits: &mut [Commit]) {
@@ -406,6 +428,10 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn snapshot(repo: &Path) -> Result<Snapshot, String> {
+        snapshot_with_limit(repo, 300)
+    }
+
     #[test]
     fn parses_status_with_spaces_and_rename() {
         let files =
@@ -425,6 +451,22 @@ mod tests {
         assert_eq!(
             split_command("git add -- \"a file.txt\"").unwrap(),
             ["add", "--", "a file.txt"]
+        );
+    }
+
+    #[test]
+    fn suggests_clone_folder_for_https_ssh_and_local_repositories() {
+        assert_eq!(
+            default_clone_directory("https://github.com/example/my-repo.git"),
+            Some("my-repo".into())
+        );
+        assert_eq!(
+            default_clone_directory("git@github.com:example/my-repo.git"),
+            Some("my-repo".into())
+        );
+        assert_eq!(
+            default_clone_directory("C:\\projects\\local-repo"),
+            Some("local-repo".into())
         );
     }
 
@@ -485,9 +527,31 @@ mod tests {
         let committed = snapshot(&root).unwrap();
         assert_eq!(committed.commits.len(), 1);
         assert!(committed.status.is_empty());
+        std::fs::write(root.join("a file.txt"), "hello again\n").unwrap();
+        run(&root, &["add", "--", "a file.txt"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Second",
+            ],
+        )
+        .unwrap();
+        let limited = snapshot_with_limit(&root, 1).unwrap();
+        assert_eq!(limited.commits.len(), 1);
+        assert!(limited.has_more_commits);
+        assert_eq!(snapshot_with_limit(&root, 2).unwrap().commits.len(), 2);
+        assert!(!snapshot_with_limit(&root, 2).unwrap().has_more_commits);
         let clone_path = root.with_extension("cloned repository");
         let cloned = clone_repo(&root.to_string_lossy(), &clone_path).unwrap();
-        assert_eq!(snapshot(&cloned).unwrap().commits.len(), 1);
+        let clone_snapshot = snapshot(&cloned).unwrap();
+        assert_eq!(clone_snapshot.commits.len(), 2);
+        assert!(!clone_snapshot.remote_branches.is_empty());
         std::fs::remove_dir_all(cloned).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -541,6 +605,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_only_selected_local_branch_and_tag() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-refs-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        std::fs::write(root.join("readme.txt"), "base\n").unwrap();
+        run(&root, &["add", "--", "readme.txt"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Base",
+            ],
+        )
+        .unwrap();
+        run(&root, &["branch", "old-branch"]).unwrap();
+        run(&root, &["tag", "old-tag"]).unwrap();
+        run(&root, &["branch", "-d", "--", "old-branch"]).unwrap();
+        run(&root, &["tag", "-d", "--", "old-tag"]).unwrap();
+        let snapshot = snapshot(&root).unwrap();
+        assert!(!snapshot.branches.iter().any(|r| r.name == "old-branch"));
+        assert!(!snapshot.tags.iter().any(|r| r.name == "old-tag"));
+        assert!(snapshot.branches.iter().any(|r| r.current));
         std::fs::remove_dir_all(root).unwrap();
     }
 }
