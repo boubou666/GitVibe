@@ -153,6 +153,7 @@ fn blue() -> Color32 {
 enum Page {
     History,
     Changes,
+    CommitDiff,
     Repositories,
     Changelog,
     Branches,
@@ -180,6 +181,12 @@ enum UpdateDone {
 enum CommitAction {
     CherryPick,
     Revert,
+}
+
+#[derive(Clone, Copy)]
+enum RefAtKind {
+    Branch,
+    Tag,
 }
 
 #[derive(Clone)]
@@ -233,6 +240,7 @@ pub struct GitVibe {
     recent_repos: Vec<PathBuf>,
     pinned_repos: Vec<PathBuf>,
     repo_filter: String,
+    branch_filter: String,
     theme_choice: ThemeChoice,
     snapshot: Option<Snapshot>,
     page: Page,
@@ -267,6 +275,8 @@ pub struct GitVibe {
     show_clone: bool,
     confirm_discard: Option<String>,
     confirm_commit_action: Option<(CommitAction, String)>,
+    confirm_checkout_commit: Option<String>,
+    create_ref_at: Option<(RefAtKind, String)>,
     confirm_delete_ref: Option<RefDeletion>,
     confirm_reset: Option<String>,
     confirm_conflict_side: Option<(String, git::ConflictSide)>,
@@ -283,6 +293,7 @@ pub struct GitVibe {
 impl GitVibe {
     fn set_theme(&self, ctx: &egui::Context) {
         PALETTE.with(|palette| palette.set(Palette::for_choice(self.theme_choice)));
+        ctx.set_theme(egui::Theme::Dark);
         let mut visuals = ctx.style_of(egui::Theme::Dark).visuals.clone();
         visuals.override_text_color = Some(text());
         visuals.weak_text_color = Some(muted());
@@ -304,10 +315,14 @@ impl GitVibe {
         visuals.selection.bg_fill = elevated();
         visuals.selection.stroke = Stroke::new(1.0, accent());
         visuals.hyperlink_color = accent();
-        ctx.set_visuals(visuals);
+        ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
+        ctx.set_visuals_of(egui::Theme::Light, visuals);
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        cc.egui_ctx
+            .set_pixels_per_point(cc.egui_ctx.pixels_per_point() * 1.16);
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
         let theme_choice = cc
             .storage
             .and_then(|storage| eframe::get_value::<ThemeChoice>(storage, "theme_choice"))
@@ -343,8 +358,10 @@ impl GitVibe {
         visuals.selection.bg_fill = elevated();
         visuals.selection.stroke = Stroke::new(1.0, accent());
         visuals.hyperlink_color = accent();
-        cc.egui_ctx.set_visuals(visuals);
-        cc.egui_ctx.style_mut_of(egui::Theme::Dark, |s| {
+        cc.egui_ctx
+            .set_visuals_of(egui::Theme::Dark, visuals.clone());
+        cc.egui_ctx.set_visuals_of(egui::Theme::Light, visuals);
+        cc.egui_ctx.all_styles_mut(|s| {
             s.spacing.item_spacing = egui::vec2(5.0, 4.0);
             s.spacing.button_padding = egui::vec2(8.0, 4.0);
             s.spacing.interact_size.y = 26.0;
@@ -394,6 +411,7 @@ impl GitVibe {
             recent_repos,
             pinned_repos,
             repo_filter: String::new(),
+            branch_filter: String::new(),
             theme_choice,
             snapshot: None,
             page: Page::History,
@@ -428,6 +446,8 @@ impl GitVibe {
             show_clone: false,
             confirm_discard: None,
             confirm_commit_action: None,
+            confirm_checkout_commit: None,
+            create_ref_at: None,
             confirm_delete_ref: None,
             confirm_reset: None,
             confirm_conflict_side: None,
@@ -837,23 +857,23 @@ impl GitVibe {
                     if toolbar_action(ui, "Refresh") {
                         self.queue(Job::Refresh);
                     }
-                    if toolbar_action(ui, "Fetch") {
-                        self.git(&["fetch", "--all", "--prune"]);
-                    }
-                    if toolbar_action(ui, "Pull") {
-                        self.git(&["pull"]);
-                    }
-                    if toolbar_action(ui, "Push") {
-                        self.git(&["push"]);
-                    }
-                    if toolbar_action(ui, "Branch") {
-                        self.page = Page::Branches;
+                    if toolbar_action(ui, "Git console") {
+                        self.terminal_open = !self.terminal_open;
                     }
                     if toolbar_action(ui, "Stash") {
                         self.page = Page::Stashes;
                     }
-                    if toolbar_action(ui, "Git console") {
-                        self.terminal_open = !self.terminal_open;
+                    if toolbar_action(ui, "Branch") {
+                        self.page = Page::Branches;
+                    }
+                    if toolbar_action(ui, "Push") {
+                        self.git(&["push"]);
+                    }
+                    if toolbar_action(ui, "Pull") {
+                        self.git(&["pull"]);
+                    }
+                    if toolbar_action(ui, "Fetch") {
+                        self.git(&["fetch", "--all", "--prune"]);
                     }
                 });
                 if self.busy {
@@ -883,67 +903,53 @@ impl GitVibe {
     }
 
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.spacing_mut().interact_size.y = 34.0;
         ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Launchpad").size(11.5).strong())
-                        .fill(if self.page == Page::Repositories {
-                            panel()
-                        } else {
-                            panel_alt()
-                        })
-                        .stroke(Stroke::new(1.0, border())),
-                )
-                .clicked()
-            {
+            let (open_launchpad, _) = workspace_tab(
+                ui,
+                egui::Id::new("launchpad_tab"),
+                "Launchpad",
+                self.page == Page::Repositories,
+                false,
+                124.0,
+            );
+            if open_launchpad {
                 self.page = Page::Repositories;
             }
+
             let tabs = self.open_repo_tabs.clone();
-            for path in tabs.iter().take(4) {
-                let label = path
+            for path in tabs.iter().take(6) {
+                let full_name = path
                     .file_name()
                     .unwrap_or(path.as_os_str())
                     .to_string_lossy();
+                let mut label = full_name.chars().take(17).collect::<String>();
+                if full_name.chars().count() > 17 {
+                    label.push_str("...");
+                }
                 let selected = self.repo.as_deref() == Some(path.as_path())
                     && !matches!(self.page, Page::Repositories | Page::Changelog);
-                ui.horizontal(|ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new(label.as_ref()).size(11.5).color(if selected {
-                                        accent()
-                                    } else {
-                                        text()
-                                    }),
-                                )
-                                .fill(if selected { panel() } else { panel_alt() })
-                                .stroke(Stroke::NONE)
-                                .min_size(egui::vec2(90.0, 25.0)),
-                            )
-                            .on_hover_text(path.to_string_lossy())
-                            .clicked()
-                        {
-                            if self.repo.as_deref() != Some(path.as_path()) {
-                                self.queue(Job::Open(path.clone()));
-                            }
-                            self.page = Page::History;
-                        }
-                        if ui
-                            .add_enabled(!self.busy, egui::Button::new("×").small())
-                            .on_hover_text("Close repository tab")
-                            .clicked()
-                        {
-                            self.close_repository_tab(path);
-                        }
-                    });
-                });
-                ui.separator();
+                let (opened, closed) = workspace_tab(
+                    ui,
+                    egui::Id::new(("repo_tab", path)),
+                    &label,
+                    selected,
+                    true,
+                    150.0,
+                );
+                if closed && !self.busy {
+                    self.close_repository_tab(path);
+                } else if opened {
+                    if self.repo.as_deref() != Some(path.as_path()) {
+                        self.queue(Job::Open(path.clone()));
+                    }
+                    self.page = Page::History;
+                }
             }
-            if tabs.len() > 4 {
-                ui.menu_button(format!("More ({})", tabs.len() - 4), |ui| {
-                    for path in tabs.iter().skip(4) {
+            if tabs.len() > 6 {
+                ui.menu_button(format!("More ({})", tabs.len() - 6), |ui| {
+                    for path in tabs.iter().skip(6) {
                         if ui
                             .button(
                                 path.file_name()
@@ -960,47 +966,29 @@ impl GitVibe {
                 });
             }
             if self.changelog_open {
-                ui.horizontal(|ui| {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("Changelog").size(11.5).color(
-                                    if self.page == Page::Changelog {
-                                        accent()
-                                    } else {
-                                        text()
-                                    },
-                                ))
-                                .fill(if self.page == Page::Changelog {
-                                    panel()
-                                } else {
-                                    panel_alt()
-                                })
-                                .stroke(Stroke::NONE),
-                            )
-                            .clicked()
-                        {
-                            self.page = Page::Changelog;
-                        }
-                        if ui
-                            .small_button("×")
-                            .on_hover_text("Close changelog tab")
-                            .clicked()
-                        {
-                            self.changelog_open = false;
-                            if self.page == Page::Changelog {
-                                self.page = if self.repo.is_some() {
-                                    Page::History
-                                } else {
-                                    Page::Repositories
-                                };
-                            }
-                        }
-                    });
-                });
-                ui.separator();
+                let (opened, closed) = workspace_tab(
+                    ui,
+                    egui::Id::new("changelog_tab"),
+                    "Changelog",
+                    self.page == Page::Changelog,
+                    true,
+                    142.0,
+                );
+                if closed {
+                    self.changelog_open = false;
+                    if self.page == Page::Changelog {
+                        self.page = if self.repo.is_some() {
+                            Page::History
+                        } else {
+                            Page::Repositories
+                        };
+                    }
+                } else if opened {
+                    self.page = Page::Changelog;
+                }
             }
-            ui.menu_button("+", |ui| {
+            ui.add_space(5.0);
+            ui.menu_button(RichText::new("+").size(15.0).color(text()), |ui| {
                 if ui.button("Open repository...").clicked() {
                     if let Some(path) = pick_folder(self.repo.as_deref()) {
                         self.queue(Job::Open(path));
@@ -1015,336 +1003,200 @@ impl GitVibe {
                 }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let previous = self.theme_choice;
-                egui::ComboBox::from_id_salt("top_theme")
-                    .selected_text(self.theme_choice.label())
-                    .show_ui(ui, |ui| {
+                ui.menu_button(
+                    RichText::new(format!("Theme: {}", self.theme_choice.label()))
+                        .size(11.0)
+                        .color(muted()),
+                    |ui| {
+                        let previous = self.theme_choice;
                         for theme in [ThemeChoice::Aurora, ThemeChoice::Cosmic, ThemeChoice::Ember]
                         {
                             ui.selectable_value(&mut self.theme_choice, theme, theme.label());
                         }
-                    });
-                if previous != self.theme_choice {
-                    self.set_theme(ui.ctx());
-                }
+                        if previous != self.theme_choice {
+                            self.set_theme(ui.ctx());
+                        }
+                    },
+                );
             });
         });
     }
+    fn focus_ref(&mut self, short: &str) {
+        self.page = Page::History;
+        let id = self.snapshot.as_ref().and_then(|snapshot| {
+            snapshot
+                .commits
+                .iter()
+                .find(|commit| commit.short == short || commit.id.starts_with(short))
+                .map(|commit| commit.id.clone())
+        });
+        if let Some(id) = id {
+            self.select_commit(&id);
+        }
+    }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let Some(snapshot) = self.snapshot.clone() else {
+            ui.label(RichText::new("Opening repository...").color(muted()));
+            return;
+        };
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("List").size(11.5).color(text()))
+                        .fill(if self.page == Page::History {
+                            elevated()
+                        } else {
+                            panel()
+                        })
+                        .stroke(Stroke::NONE),
+                )
+                .clicked()
+            {
+                self.page = Page::History;
+            }
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("Changes").size(11.5).color(text()))
+                        .fill(if self.page == Page::Changes {
+                            elevated()
+                        } else {
+                            panel()
+                        })
+                        .stroke(Stroke::NONE),
+                )
+                .clicked()
+            {
+                self.page = Page::Changes;
+            }
+        });
+        ui.add_space(7.0);
+        ui.add(
+            egui::TextEdit::singleline(&mut self.branch_filter)
+                .hint_text("Filter branches")
+                .desired_width(ui.available_width()),
+        );
+        let filter = self.branch_filter.trim().to_lowercase();
+        let local = snapshot
+            .branches
+            .iter()
+            .filter(|branch| branch.name.to_lowercase().contains(&filter))
+            .cloned()
+            .collect::<Vec<_>>();
+        let remote = snapshot
+            .remote_branches
+            .iter()
+            .filter(|branch| branch.name.to_lowercase().contains(&filter))
+            .cloned()
+            .collect::<Vec<_>>();
+        ui.add_space(5.0);
         ui.label(
-            RichText::new("REPOSITORY")
-                .size(10.0)
+            RichText::new(format!("Viewing {}", local.len() + remote.len()))
+                .size(10.5)
+                .color(muted()),
+        );
+        ui.separator();
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("LOCAL").size(10.5).strong().color(text()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(local.len().to_string())
+                        .size(10.5)
+                        .color(accent()),
+                );
+            });
+        });
+        let mut folders = std::collections::BTreeMap::<String, Vec<git::Ref>>::new();
+        let mut direct = Vec::new();
+        for branch in local {
+            if let Some((folder, _)) = branch.name.split_once('/') {
+                folders.entry(folder.to_owned()).or_default().push(branch);
+            } else {
+                direct.push(branch);
+            }
+        }
+        for (folder, branches) in folders {
+            sidebar_folder(ui, &folder, 0.0);
+            for branch in branches {
+                let leaf = branch
+                    .name
+                    .strip_prefix(&format!("{folder}/"))
+                    .unwrap_or(&branch.name);
+                if sidebar_branch_row(ui, leaf, branch.current, 16.0) {
+                    self.focus_ref(&branch.target);
+                }
+            }
+        }
+        for branch in direct {
+            if sidebar_branch_row(ui, &branch.name, branch.current, 0.0) {
+                self.focus_ref(&branch.target);
+            }
+        }
+
+        ui.add_space(21.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("REMOTE").size(10.5).strong().color(text()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(remote.len().to_string())
+                        .size(10.5)
+                        .color(accent()),
+                );
+            });
+        });
+        for remote_name in &snapshot.remotes {
+            sidebar_folder(ui, remote_name, 0.0);
+            let prefix = format!("{remote_name}/");
+            for branch in remote
+                .iter()
+                .filter(|branch| branch.name.starts_with(&prefix))
+            {
+                let leaf = branch.name.strip_prefix(&prefix).unwrap_or(&branch.name);
+                if sidebar_branch_row(ui, leaf, false, 16.0) {
+                    self.focus_ref(&branch.target);
+                }
+            }
+        }
+
+        ui.add_space(21.0);
+        ui.separator();
+        ui.label(
+            RichText::new(format!("TAGS  {}", snapshot.tags.len()))
+                .size(10.5)
                 .strong()
                 .color(muted()),
         );
-        if self.snapshot.is_some() {
-            ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.page == Page::History, "List")
-                    .clicked()
-                {
-                    self.page = Page::History;
-                }
-                if ui
-                    .selectable_label(self.page == Page::Changes, "Changes")
-                    .clicked()
-                {
-                    self.page = Page::Changes;
-                }
-            });
-            ui.separator();
-            if let Some(snapshot) = self.snapshot.clone() {
-                ui.label(
-                    RichText::new(format!("LOCAL  {}", snapshot.branches.len()))
-                        .size(10.0)
-                        .strong()
-                        .color(muted()),
-                );
-                ui.add_space(5.0);
-                for branch in &snapshot.branches {
-                    let selected = branch.current;
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(&branch.name).size(12.0).color(if selected {
-                                    accent()
-                                } else {
-                                    text()
-                                }),
-                            )
-                            .fill(if selected {
-                                elevated()
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .stroke(Stroke::NONE)
-                            .min_size(egui::vec2(ui.available_width(), 24.0)),
-                        )
-                        .clicked()
-                    {
-                        self.page = Page::Branches;
-                    }
-                }
-                ui.add_space(11.0);
-                ui.label(
-                    RichText::new(format!("REMOTE  {}", snapshot.remote_branches.len()))
-                        .size(10.0)
-                        .strong()
-                        .color(muted()),
-                );
-                ui.add_space(5.0);
-                for branch in snapshot.remote_branches.iter().take(20) {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                RichText::new(&branch.name).size(11.5).color(muted()),
-                            )
-                            .fill(Color32::TRANSPARENT)
-                            .stroke(Stroke::NONE)
-                            .min_size(egui::vec2(ui.available_width(), 23.0)),
-                        )
-                        .clicked()
-                    {
-                        self.page = Page::Branches;
-                    }
-                }
-                ui.add_space(11.0);
-                ui.label(
-                    RichText::new(format!("TAGS  {}", snapshot.tags.len()))
-                        .size(10.0)
-                        .strong()
-                        .color(muted()),
-                );
-                for tag in snapshot.tags.iter().take(8) {
-                    ui.label(RichText::new(&tag.name).size(11.0).color(orange()));
-                }
-            } else {
-                ui.label(RichText::new("Open a repository to see branches.").color(muted()));
+        for tag in snapshot.tags.iter().take(12) {
+            if (filter.is_empty() || tag.name.to_lowercase().contains(&filter))
+                && sidebar_branch_row(ui, &tag.name, false, 0.0)
+            {
+                self.focus_ref(&tag.target);
             }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                for (page, title) in [
-                    (Page::Branches, "Branches"),
-                    (Page::Stashes, "Stashes"),
-                    (Page::Console, "Terminal"),
-                    (Page::Updates, "Updates"),
-                ] {
-                    if ui.small_button(title).clicked() {
-                        self.page = page;
-                    }
-                }
-            });
-            return;
         }
-        ui.add_space(25.0);
-        ui.label(RichText::new("EXPLORE").size(10.0).strong().color(muted()));
-        ui.add_space(3.0);
-        let changed = self.snapshot.as_ref().map_or(0, |s| s.status.len());
+
+        ui.add_space(20.0);
+        ui.separator();
         for (page, title) in [
-            (Page::History, "Commit graph"),
-            (Page::Changes, "Changes"),
-            (Page::Repositories, "Repositories"),
             (Page::Branches, "Branches & tags"),
             (Page::Stashes, "Stashes"),
             (Page::Console, "Git console"),
             (Page::Updates, "Updates"),
         ] {
-            let selected = self.page == page;
-            let label = if page == Page::Changes && changed > 0 {
-                format!("{title}  ({changed})")
-            } else if page == Page::Updates
-                && matches!(
-                    self.update_state,
-                    UpdateState::Available(_) | UpdateState::Ready(_, _)
-                )
-            {
-                format!("{title}  (new)")
-            } else {
-                title.to_owned()
-            };
-            let shown = egui::Frame::new()
-                .fill(if selected {
-                    elevated()
-                } else {
-                    Color32::TRANSPARENT
-                })
-                .corner_radius(egui::CornerRadius::same(7))
-                .stroke(if selected {
-                    Stroke::new(1.0, border())
-                } else {
-                    Stroke::NONE
-                })
-                .inner_margin(egui::Margin::symmetric(11, 8))
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        nav_icon(ui, page, if selected { accent() } else { muted() });
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(label).size(13.0).strong().color(if selected {
-                            accent()
-                        } else {
-                            text()
-                        }));
-                    });
-                });
             if ui
-                .interact(
-                    shown.response.rect,
-                    egui::Id::new(("nav", title)),
-                    egui::Sense::click(),
+                .add(
+                    egui::Button::new(RichText::new(title).size(11.5).color(muted()))
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::NONE)
+                        .min_size(egui::vec2(ui.available_width(), 22.0)),
                 )
                 .clicked()
             {
                 self.page = page;
             }
-            ui.add_space(3.0);
-        }
-        ui.add_space(12.0);
-        ui.label(
-            RichText::new("APPEARANCE")
-                .size(10.0)
-                .strong()
-                .color(muted()),
-        );
-        let old_theme = self.theme_choice;
-        egui::ComboBox::from_id_salt("theme_choice")
-            .selected_text(self.theme_choice.label())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for theme in [ThemeChoice::Aurora, ThemeChoice::Cosmic, ThemeChoice::Ember] {
-                    ui.selectable_value(&mut self.theme_choice, theme, theme.label());
-                }
-            });
-        if self.theme_choice != old_theme {
-            self.set_theme(ui.ctx());
-        }
-        ui.add_space(24.0);
-        egui::Frame::new()
-            .fill(panel_alt())
-            .corner_radius(egui::CornerRadius::same(10))
-            .stroke(Stroke::new(1.0, border()))
-            .inner_margin(egui::Margin::same(12))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new("REPOSITORY")
-                        .size(10.0)
-                        .strong()
-                        .color(muted()),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.path_input)
-                        .hint_text("Path to repository")
-                        .desired_width(ui.available_width()),
-                );
-                ui.horizontal(|ui| {
-                    if action(ui, "Open", true) {
-                        self.queue(Job::Open(PathBuf::from(self.path_input.trim())));
-                    }
-                    if action(ui, "Browse...", false)
-                        && let Some(path) = pick_folder(Some(Path::new(&self.path_input)))
-                    {
-                        self.path_input = path.to_string_lossy().into_owned();
-                        self.queue(Job::Open(path));
-                    }
-                    if action(ui, "Initialize", false) {
-                        self.queue(Job::Init(PathBuf::from(self.path_input.trim())));
-                    }
-                });
-                if action(ui, "+  Clone repository", false) {
-                    self.show_clone = true;
-                }
-            });
-        if !self.recent_repos.is_empty() {
-            ui.add_space(15.0);
-            ui.label(
-                RichText::new("RECENT REPOSITORIES")
-                    .size(10.0)
-                    .strong()
-                    .color(muted()),
-            );
-            let mut shown = self.pinned_repos.clone();
-            for path in &self.recent_repos {
-                if !shown.contains(path) {
-                    shown.push(path.clone());
-                }
-            }
-            for path in shown.into_iter().take(5) {
-                ui.horizontal(|ui| {
-                    let name = path
-                        .file_name()
-                        .unwrap_or(path.as_os_str())
-                        .to_string_lossy();
-                    if self.pinned_repos.contains(&path) {
-                        ui.label(RichText::new("★").color(accent()).size(12.0));
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new(name).size(11.5).color(text()))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
-                        )
-                        .on_hover_text(path.to_string_lossy())
-                        .clicked()
-                    {
-                        self.queue(Job::Open(path.clone()));
-                    }
-                });
-            }
-            if ui.small_button("Manage repositories →").clicked() {
-                self.page = Page::Repositories;
-            }
-        }
-        ui.add_space(22.0);
-        if let Some(snapshot) = &self.snapshot {
-            let branches = snapshot.branches.clone();
-            let remotes = snapshot.remotes.clone();
-            ui.label(
-                RichText::new("LOCAL BRANCHES")
-                    .size(10.0)
-                    .strong()
-                    .color(muted()),
-            );
-            ui.add_space(3.0);
-            for branch in branches.iter().take(12) {
-                let shown = ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(12.0, 20.0), egui::Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        4.0,
-                        if branch.current { accent() } else { muted() },
-                    );
-                    ui.label(
-                        RichText::new(&branch.name)
-                            .size(12.0)
-                            .color(if branch.current { accent() } else { muted() }),
-                    );
-                });
-                if ui
-                    .interact(
-                        shown.response.rect,
-                        egui::Id::new(("branch", &branch.name)),
-                        egui::Sense::click(),
-                    )
-                    .clicked()
-                {
-                    self.page = Page::Branches;
-                }
-            }
-            ui.add_space(15.0);
-            ui.label(RichText::new("REMOTES").size(10.0).strong().color(muted()));
-            for remote in remotes {
-                ui.label(
-                    RichText::new(format!("remote  {remote}"))
-                        .size(12.0)
-                        .color(muted()),
-                );
-            }
         }
     }
-
     fn history(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Viewing history").size(11.0).color(muted()));
@@ -1461,6 +1313,7 @@ impl GitVibe {
                         if response.clicked() {
                             self.select_commit(&commit.id);
                         }
+                        response.context_menu(|ui| self.commit_context_menu(ui, commit));
                         response.on_hover_text(format!(
                             "{}\n{} | {} | {}",
                             commit.subject, commit.short, commit.author, commit.date
@@ -1547,6 +1400,7 @@ impl GitVibe {
                     if response.clicked() {
                         self.select_commit(&commit.id);
                     }
+                    response.context_menu(|ui| self.commit_context_menu(ui, commit));
                     response.on_hover_text(format!(
                         "{}\n{} | {} | {}",
                         commit.subject, commit.short, commit.author, commit.date
@@ -1573,6 +1427,111 @@ impl GitVibe {
         self.commit_files.clear();
         self.commit_files_id = None;
         self.queue(Job::InspectCommit(id.to_owned()));
+    }
+
+    fn commit_context_menu(&mut self, ui: &mut egui::Ui, commit: &git::Commit) {
+        ui.set_min_width(245.0);
+        let id = commit.id.clone();
+        if ui.button("Show commit diff").clicked() {
+            self.selected_commit = Some(id.clone());
+            self.page = Page::CommitDiff;
+            self.queue(Job::Inspect(vec![
+                "show".into(),
+                "--format=fuller".into(),
+                "--patch".into(),
+                id.clone(),
+            ]));
+            ui.close();
+        }
+        if ui.button("Compare with working tree").clicked() {
+            self.selected_commit = Some(id.clone());
+            self.page = Page::CommitDiff;
+            self.queue(Job::Inspect(vec!["diff".into(), id.clone()]));
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Checkout this commit...").clicked() {
+            self.confirm_checkout_commit = Some(id.clone());
+            ui.close();
+        }
+        if ui.button("Create branch here...").clicked() {
+            self.branch_input.clear();
+            self.create_ref_at = Some((RefAtKind::Branch, id.clone()));
+            ui.close();
+        }
+        if ui.button("Create tag here...").clicked() {
+            self.tag_input.clear();
+            self.create_ref_at = Some((RefAtKind::Tag, id.clone()));
+            ui.close();
+        }
+        if ui.button("Reset current branch here...").clicked() {
+            self.confirm_reset = Some(id.clone());
+            self.reset_mode = ResetMode::Mixed;
+            self.reset_confirmation.clear();
+            ui.close();
+        }
+        ui.separator();
+        if commit.parents.len() < 2 {
+            if ui.button("Cherry-pick commit...").clicked() {
+                self.confirm_commit_action = Some((CommitAction::CherryPick, id.clone()));
+                ui.close();
+            }
+            if ui.button("Revert commit...").clicked() {
+                self.confirm_commit_action = Some((CommitAction::Revert, id.clone()));
+                ui.close();
+            }
+        }
+        if self.compare_base.as_deref() == Some(&id) {
+            if ui.button("Clear compare base").clicked() {
+                self.compare_base = None;
+                ui.close();
+            }
+        } else {
+            if ui.button("Set compare base").clicked() {
+                self.compare_base = Some(id.clone());
+                ui.close();
+            }
+            if let Some(base) = self.compare_base.clone()
+                && ui.button("Compare with base").clicked()
+            {
+                self.selected_commit = Some(id.clone());
+                self.page = Page::CommitDiff;
+                self.queue(Job::Inspect(vec![
+                    "diff".into(),
+                    "--no-color".into(),
+                    base,
+                    id.clone(),
+                ]));
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button("Copy commit SHA").clicked() {
+            ui.ctx().copy_text(id);
+            ui.close();
+        }
+    }
+
+    fn commit_diff_view(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Back to graph").clicked() {
+                self.page = Page::History;
+            }
+            if let Some(id) = &self.selected_commit {
+                ui.label(
+                    RichText::new(format!("Commit {}", &id[..id.len().min(12)]))
+                        .size(12.0)
+                        .strong()
+                        .color(text()),
+                );
+            }
+        });
+        ui.separator();
+        if self.detail.is_empty() {
+            ui.label(RichText::new("Loading commit diff...").color(muted()));
+        } else {
+            self.detail_view(ui);
+        }
     }
 
     fn changes(&mut self, ui: &mut egui::Ui) {
@@ -2599,6 +2558,7 @@ impl GitVibe {
                 ui.add_enabled_ui(!self.busy, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if action(ui, "Show patch", false) {
+                            self.page = Page::CommitDiff;
                             self.queue(Job::Inspect(vec![
                                 "show".into(),
                                 "--format=fuller".into(),
@@ -2610,6 +2570,7 @@ impl GitVibe {
                         if let Some(parent) = commit.parents.first()
                             && action(ui, "Compare parent", false)
                         {
+                            self.page = Page::CommitDiff;
                             self.queue(Job::Inspect(vec![
                                 "diff".into(),
                                 "--no-color".into(),
@@ -2638,6 +2599,7 @@ impl GitVibe {
                             if let Some(base) = self.compare_base.clone()
                                 && action(ui, "Compare with base", false)
                             {
+                                self.page = Page::CommitDiff;
                                 self.queue(Job::Inspect(vec![
                                     "diff".into(),
                                     "--no-color".into(),
@@ -2846,7 +2808,7 @@ impl GitVibe {
         } else {
             ui.label(RichText::new("Open a repository to inspect its history.").color(muted()));
         }
-        if self.page != Page::Changes {
+        if self.page != Page::Changes && self.selected_commit.is_none() {
             self.detail_view(ui);
         }
     }
@@ -3255,6 +3217,69 @@ impl GitVibe {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.conflict_dialog(ctx);
+        if let Some(id) = self.confirm_checkout_commit.clone() {
+            egui::Window::new("Checkout commit?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Switch to commit {} with a detached HEAD?",
+                        &id[..id.len().min(12)]
+                    ));
+                    ui.label("Git will protect working changes that cannot be carried across.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_checkout_commit = None;
+                        }
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Checkout commit"))
+                            .clicked()
+                        {
+                            self.git_owned(vec!["switch".into(), "--detach".into(), id]);
+                            self.confirm_checkout_commit = None;
+                            self.page = Page::History;
+                        }
+                    });
+                });
+        }
+        if let Some((kind, id)) = self.create_ref_at.clone() {
+            let (title, label) = match kind {
+                RefAtKind::Branch => ("Create branch here", "Branch name"),
+                RefAtKind::Tag => ("Create tag here", "Tag name"),
+            };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("At commit {}", &id[..id.len().min(12)]));
+                    ui.label(label);
+                    let name = match kind {
+                        RefAtKind::Branch => &mut self.branch_input,
+                        RefAtKind::Tag => &mut self.tag_input,
+                    };
+                    ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
+                    let value = name.trim().to_owned();
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.create_ref_at = None;
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.busy && !value.is_empty(),
+                                egui::Button::new("Create"),
+                            )
+                            .clicked()
+                        {
+                            let command = match kind {
+                                RefAtKind::Branch => "branch",
+                                RefAtKind::Tag => "tag",
+                            };
+                            self.git_owned(vec![command.into(), value, id]);
+                            self.create_ref_at = None;
+                        }
+                    });
+                });
+        }
         if self.show_clone {
             let mut open = true;
             egui::Window::new("Clone repository")
@@ -3556,7 +3581,7 @@ impl eframe::App for GitVibe {
                 });
             });
         if repository_view {
-            egui::Panel::left("nav")
+            egui::Panel::left("nav_compact")
                 .resizable(true)
                 .default_size(208.0)
                 .min_size(170.0)
@@ -3573,7 +3598,7 @@ impl eframe::App for GitVibe {
                 });
         }
         if repository_view {
-            egui::Panel::right("inspector")
+            egui::Panel::right("inspector_compact")
                 .resizable(true)
                 .default_size(340.0)
                 .min_size(260.0)
@@ -3619,6 +3644,7 @@ impl eframe::App for GitVibe {
             .show(ui, |ui| match self.page {
                 Page::History => self.history(ui),
                 Page::Changes => self.change_diff_view(ui),
+                Page::CommitDiff => self.commit_diff_view(ui),
                 Page::Repositories => self.repositories(ui),
                 Page::Changelog => self.changelog(ui),
                 Page::Branches => self.branches(ui),
@@ -3919,6 +3945,154 @@ fn paint_commit_row(
     response
 }
 
+fn workspace_tab(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    title: &str,
+    selected: bool,
+    closeable: bool,
+    width: f32,
+) -> (bool, bool) {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+    let fill = if selected { bg() } else { panel_alt() };
+    ui.painter().rect_filled(rect, 0.0, fill);
+    ui.painter().line_segment(
+        [rect.right_top(), rect.right_bottom()],
+        Stroke::new(1.0, border()),
+    );
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.left(), rect.bottom() - 2.0),
+                egui::vec2(rect.width(), 2.0),
+            ),
+            0.0,
+            accent(),
+        );
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 12.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        title,
+        egui::FontId::proportional(12.0),
+        text(),
+    );
+    let mut close_clicked = false;
+    if closeable {
+        let close_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 15.0, rect.center().y),
+            egui::vec2(18.0, 18.0),
+        );
+        let close_response = ui
+            .interact(close_rect, id.with("close"), egui::Sense::click())
+            .on_hover_text("Close tab");
+        if close_response.hovered() {
+            ui.painter().rect_filled(close_rect, 3.0, elevated());
+        }
+        let c = close_rect.center();
+        for (from, to) in [
+            (
+                egui::pos2(c.x - 3.0, c.y - 3.0),
+                egui::pos2(c.x + 3.0, c.y + 3.0),
+            ),
+            (
+                egui::pos2(c.x + 3.0, c.y - 3.0),
+                egui::pos2(c.x - 3.0, c.y + 3.0),
+            ),
+        ] {
+            ui.painter()
+                .line_segment([from, to], Stroke::new(1.4, muted()));
+        }
+        close_clicked = close_response.clicked();
+    }
+    (response.clicked() && !close_clicked, close_clicked)
+}
+
+fn sidebar_folder(ui: &mut egui::Ui, label: &str, depth: f32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
+    let x = rect.left() + 14.0 + depth;
+    let icon =
+        egui::Rect::from_min_size(egui::pos2(x, rect.center().y - 4.0), egui::vec2(10.0, 8.0));
+    ui.painter().rect_stroke(
+        icon,
+        1.0,
+        Stroke::new(1.0, muted()),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        egui::pos2(x + 16.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        muted(),
+    );
+}
+
+fn sidebar_branch_row(ui: &mut egui::Ui, label: &str, selected: bool, depth: f32) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), egui::Sense::click());
+    if selected {
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_rgb(48, 87, 66));
+        let box_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::vec2(10.0, 10.0),
+        );
+        ui.painter()
+            .rect_filled(box_rect, 1.0, Color32::from_rgb(83, 177, 105));
+        ui.painter().line_segment(
+            [
+                egui::pos2(box_rect.left() + 2.0, box_rect.center().y),
+                egui::pos2(box_rect.left() + 4.2, box_rect.bottom() - 2.0),
+            ],
+            Stroke::new(1.3, text()),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(box_rect.left() + 4.2, box_rect.bottom() - 2.0),
+                egui::pos2(box_rect.right() - 1.7, box_rect.top() + 2.0),
+            ],
+            Stroke::new(1.3, text()),
+        );
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 0.0, panel_alt());
+    }
+    let x = rect.left() + 14.0 + depth;
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, rect.center().y - 4.0),
+            egui::pos2(x, rect.center().y + 3.0),
+        ],
+        Stroke::new(1.0, if selected { text() } else { muted() }),
+    );
+    ui.painter().circle_filled(
+        egui::pos2(x, rect.center().y - 4.0),
+        1.8,
+        if selected { text() } else { muted() },
+    );
+    ui.painter().circle_filled(
+        egui::pos2(x + 4.0, rect.center().y + 1.0),
+        1.8,
+        if selected { text() } else { muted() },
+    );
+    ui.painter().line_segment(
+        [
+            egui::pos2(x, rect.center().y + 1.0),
+            egui::pos2(x + 4.0, rect.center().y + 1.0),
+        ],
+        Stroke::new(1.0, if selected { text() } else { muted() }),
+    );
+    ui.painter().text(
+        egui::pos2(x + 13.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(11.5),
+        if selected { text() } else { muted() },
+    );
+    response.clicked()
+}
+
 fn toolbar_action(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(
         egui::Button::new(RichText::new(label).size(11.5).color(text()))
@@ -3993,128 +4167,5 @@ fn brand_icon(ui: &mut egui::Ui) {
         egui::pos2(right, rect.center().y + 6.0),
     ] {
         painter.circle_filled(pos, 3.5, bg());
-    }
-}
-
-fn nav_icon(ui: &mut egui::Ui, page: Page, color: Color32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
-    let painter = ui.painter();
-    let x = rect.left();
-    let y = rect.top();
-    let stroke = Stroke::new(1.7, color);
-    match page {
-        Page::History => {
-            painter.line_segment(
-                [egui::pos2(x + 9.0, y + 2.0), egui::pos2(x + 9.0, y + 16.0)],
-                stroke,
-            );
-            for offset in [3.0, 9.0, 15.0] {
-                painter.circle_filled(egui::pos2(x + 9.0, y + offset), 2.4, color);
-            }
-        }
-        Page::Changes => {
-            painter.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(x + 4.0, y + 2.0), egui::vec2(10.0, 14.0)),
-                2.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            for offset in [6.0, 10.0, 14.0] {
-                painter.line_segment(
-                    [
-                        egui::pos2(x + 7.0, y + offset),
-                        egui::pos2(x + 12.0, y + offset),
-                    ],
-                    stroke,
-                );
-            }
-        }
-        Page::Repositories => {
-            painter.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(x + 2.0, y + 5.0), egui::vec2(14.0, 10.0)),
-                2.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 3.0, y + 3.0), egui::pos2(x + 8.0, y + 3.0)],
-                stroke,
-            );
-        }
-        Page::Changelog => {
-            painter.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(x + 4.0, y + 2.0), egui::vec2(10.0, 14.0)),
-                2.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-        }
-        Page::Branches => {
-            painter.line_segment(
-                [egui::pos2(x + 4.0, y + 3.0), egui::pos2(x + 4.0, y + 15.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 4.0, y + 11.0), egui::pos2(x + 13.0, y + 5.0)],
-                stroke,
-            );
-            for pos in [
-                egui::pos2(x + 4.0, y + 3.0),
-                egui::pos2(x + 4.0, y + 15.0),
-                egui::pos2(x + 13.0, y + 5.0),
-            ] {
-                painter.circle_filled(pos, 2.3, color);
-            }
-        }
-        Page::Stashes => {
-            painter.rect_stroke(
-                egui::Rect::from_min_size(egui::pos2(x + 2.0, y + 8.0), egui::vec2(14.0, 7.0)),
-                2.0,
-                stroke,
-                egui::StrokeKind::Inside,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 4.0, y + 5.0), egui::pos2(x + 14.0, y + 5.0)],
-                stroke,
-            );
-        }
-        Page::Console => {
-            painter.line_segment(
-                [egui::pos2(x + 3.0, y + 4.0), egui::pos2(x + 8.0, y + 9.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 8.0, y + 9.0), egui::pos2(x + 3.0, y + 14.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(x + 10.0, y + 14.0),
-                    egui::pos2(x + 16.0, y + 14.0),
-                ],
-                stroke,
-            );
-        }
-        Page::Updates => {
-            painter.line_segment(
-                [egui::pos2(x + 9.0, y + 2.0), egui::pos2(x + 9.0, y + 12.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 5.0, y + 8.0), egui::pos2(x + 9.0, y + 12.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [egui::pos2(x + 13.0, y + 8.0), egui::pos2(x + 9.0, y + 12.0)],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    egui::pos2(x + 3.0, y + 16.0),
-                    egui::pos2(x + 15.0, y + 16.0),
-                ],
-                stroke,
-            );
-        }
     }
 }

@@ -9,6 +9,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
+- Right-click a commit for checkout, branch and tag creation, reset, cherry-pick, revert, comparisons, and SHA copying. Commit patches open in the center pane.
 - Review numbered diffs with highlighted edits; stage or unstage files, individual text hunks, or lines; discard edits and commit changes.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.

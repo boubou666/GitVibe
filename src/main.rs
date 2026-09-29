@@ -3,6 +3,8 @@ mod git;
 mod updates;
 
 fn main() -> eframe::Result {
+    #[cfg(target_os = "windows")]
+    dark_titlebar::enable();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("GitVibe")
@@ -16,6 +18,69 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::GitVibe::new(cc)))),
     )
+}
+
+#[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
+mod dark_titlebar {
+    use std::{ffi::c_void, thread, time::Duration};
+
+    type Hwnd = *mut c_void;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(callback: extern "system" fn(Hwnd, isize) -> i32, param: isize) -> i32;
+        fn GetWindowThreadProcessId(window: Hwnd, process_id: *mut u32) -> u32;
+    }
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            window: Hwnd,
+            attribute: u32,
+            value: *const c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    struct Search {
+        process_id: u32,
+        found: bool,
+    }
+
+    extern "system" fn darken(window: Hwnd, param: isize) -> i32 {
+        let search = unsafe { &mut *(param as *mut Search) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+        if process_id != search.process_id {
+            return 1;
+        }
+        let dark = 1_i32;
+        let value = &dark as *const i32 as *const c_void;
+        let size = std::mem::size_of::<i32>() as u32;
+        let result = unsafe { DwmSetWindowAttribute(window, 20, value, size) };
+        if result != 0 {
+            unsafe { DwmSetWindowAttribute(window, 19, value, size) };
+        }
+        search.found = true;
+        0
+    }
+
+    pub fn enable() {
+        thread::spawn(|| {
+            for _ in 0..40 {
+                let mut search = Search {
+                    process_id: std::process::id(),
+                    found: false,
+                };
+                unsafe { EnumWindows(darken, &mut search as *mut Search as isize) };
+                if search.found {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+    }
 }
 
 fn icon() -> eframe::egui::IconData {

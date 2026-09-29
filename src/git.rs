@@ -143,7 +143,7 @@ pub fn commit_files(repo: &Path, id: &str) -> Result<Vec<CommitFile>, String> {
         .filter(|field| !field.is_empty())
         .collect::<Vec<_>>();
     let mut files = Vec::new();
-    for pair in fields.chunks_exact(2) {
+    for pair in fields.as_chunks::<2>().0 {
         files.push(CommitFile {
             status: String::from_utf8_lossy(pair[0]).trim().to_owned(),
             path: String::from_utf8_lossy(pair[1]).into_owned(),

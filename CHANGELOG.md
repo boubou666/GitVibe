@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Render graph lanes without the previous nine-lane limit, with horizontal scrolling for wide merge histories.
 - Tightened the desktop layout around flat repository tabs, a narrower branch rail, a graphite theme, aligned graph columns, compact change rows, and a docked Git console.
 - Select the newest commit when opening a repository so its details appear immediately.
+- Replaced stock tab controls with one aligned tab strip, applied dark styling to popup menus and text fields, and enabled a dark Windows title bar.
+- Grouped local and remote branches in the rail with a filter; clicking a branch returns to its graph commit.
+- Added a commit right-click menu for checkout, creating branches and tags, reset, cherry-pick, revert, comparisons, and copying the SHA.
+- Moved commit patches into a wide center view so the inspector stays focused on commit details and changed files.
 
 ## [0.5.0] - 2026-09-30
 
