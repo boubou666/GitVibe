@@ -1,6 +1,7 @@
 use std::{
+    io::Write,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 #[derive(Clone, Default)]
@@ -50,6 +51,78 @@ pub struct Ref {
     pub name: String,
     pub target: String,
     pub current: bool,
+}
+
+pub struct DiffHunk {
+    pub heading: String,
+    pub patch: String,
+    pub lines: Vec<String>,
+}
+
+pub fn diff_hunks(diff: &str) -> Vec<DiffHunk> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let Some(first_hunk) = lines.iter().position(|line| line.starts_with("@@ ")) else {
+        return Vec::new();
+    };
+    let header = &lines[..first_hunk];
+    if !header.iter().any(|line| line.starts_with("diff --git "))
+        || !header.iter().any(|line| line.starts_with("--- "))
+        || !header.iter().any(|line| line.starts_with("+++ "))
+    {
+        return Vec::new();
+    }
+    let mut hunks = Vec::new();
+    let mut start = first_hunk;
+    while start < lines.len() {
+        if !lines[start].starts_with("@@ ") {
+            break;
+        }
+        let end = (start + 1..lines.len())
+            .find(|&i| lines[i].starts_with("@@ ") || lines[i].starts_with("diff --git "))
+            .unwrap_or(lines.len());
+        let mut patch = String::new();
+        for line in header.iter().chain(&lines[start..end]) {
+            patch.push_str(line);
+            patch.push('\n');
+        }
+        hunks.push(DiffHunk {
+            heading: lines[start].to_owned(),
+            patch,
+            lines: lines[start + 1..end]
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect(),
+        });
+        start = end;
+    }
+    hunks
+}
+
+pub fn apply_hunk(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    let mut command = Command::new("git");
+    command.arg("--no-pager").arg("-C").arg(repo).arg("apply");
+    if reverse {
+        command.arg("--reverse");
+    }
+    let mut child = command
+        .args(["--cached", "--whitespace=nowarn", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start Git: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("Could not open Git input")?
+        .write_all(patch.as_bytes())
+        .map_err(|e| format!("Could not send patch to Git: {e}"))?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
 }
 
 fn git_output(repo: Option<&Path>, args: &[&str]) -> Result<Output, String> {
@@ -416,6 +489,58 @@ mod tests {
         let cloned = clone_repo(&root.to_string_lossy(), &clone_path).unwrap();
         assert_eq!(snapshot(&cloned).unwrap().commits.len(), 1);
         std::fs::remove_dir_all(cloned).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stages_and_unstages_one_hunk_without_touching_other_edits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-hunks-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        let file = root.join("notes.txt");
+        let original = (0..30)
+            .map(|i| format!("line {i:02}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &original).unwrap();
+        run(&root, &["add", "--", "notes.txt"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Base",
+            ],
+        )
+        .unwrap();
+        let edited = original
+            .replace("line 01\n", "first edit\n")
+            .replace("line 26\n", "second edit\n");
+        std::fs::write(&file, edited).unwrap();
+        let diff = run(&root, &["diff", "--no-color", "--", "notes.txt"]).unwrap();
+        let hunks = diff_hunks(&diff);
+        assert_eq!(hunks.len(), 2);
+        apply_hunk(&root, &hunks[0].patch, false).unwrap();
+        let staged = run(&root, &["diff", "--cached", "--", "notes.txt"]).unwrap();
+        assert!(staged.contains("first edit"));
+        assert!(!staged.contains("second edit"));
+        let unstaged = run(&root, &["diff", "--", "notes.txt"]).unwrap();
+        assert!(unstaged.contains("second edit"));
+        assert!(!unstaged.contains("first edit"));
+        let staged_hunk = diff_hunks(&staged);
+        apply_hunk(&root, &staged_hunk[0].patch, true).unwrap();
+        assert!(
+            run(&root, &["diff", "--cached", "--", "notes.txt"])
+                .unwrap()
+                .is_empty()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

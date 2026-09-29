@@ -7,9 +7,9 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. The comman
 1. Persist recent repositories, window state, and theme settings.
 2. Add native folder pickers and clone destination selection.
 3. Render complete commit topology and remote branch badges, with pagination beyond 300 commits.
-4. Add commit comparison, file history, blame, and richer diff rendering.
-5. Add per-hunk staging and a conflict resolver.
-6. Add guarded branch/tag deletion, cherry-pick, revert, and reset dialogs.
+4. Add richer diff rendering and compare any two commits.
+5. Add a conflict resolver and per-line staging.
+6. Add guarded branch/tag deletion and reset dialogs.
 
 ## Later
 
