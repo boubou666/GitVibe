@@ -94,6 +94,10 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 4. Keep inline Stage and Unstage buttons visible while hovered and execute their action directly.
 5. Keep long paths from expanding the resizable details pane; show the complete path in a tooltip and align Restore actions to the right.
 
+## Completed in 0.19.2
+
+1. Render commit-detail Restore buttons reliably in optimized builds while preserving fixed-width rows and aligned actions.
+
 ## Next: GitKraken workflow parity
 
 1. **Broader undo and redo.** Extend explicit recovery data beyond staging and ordinary unpublished commits to other safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
