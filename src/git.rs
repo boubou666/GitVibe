@@ -101,6 +101,117 @@ pub fn lfs_status(repo: &Path) -> Result<Option<LfsStatus>, String> {
     }))
 }
 
+pub fn restore_file_from_commit(repo: &Path, commit: &str, path: &str) -> Result<String, String> {
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Choose a valid commit before restoring a file".into());
+    }
+    if path.is_empty()
+        || Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err("Choose a repository file to restore".into());
+    }
+    let literal = format!(":(literal){path}");
+    if std::fs::symlink_metadata(repo.join(path)).is_ok()
+        && run(repo, &["ls-files", "--error-unmatch", "--", &literal]).is_err()
+    {
+        return Err(format!(
+            "{path} already exists outside Git's index; move it before restoring."
+        ));
+    }
+    if !run(repo, &["status", "--porcelain=v1", "-z", "--", &literal])?.is_empty() {
+        return Err(format!(
+            "{path} has uncommitted changes. Save, commit, or stash them before restoring this version."
+        ));
+    }
+    run(repo, &["cat-file", "-e", &format!("{commit}:{path}")])?;
+    run(
+        repo,
+        &[
+            "restore",
+            &format!("--source={commit}"),
+            "--staged",
+            "--worktree",
+            "--",
+            &literal,
+        ],
+    )?;
+    Ok(format!("Restored and staged {path} from {}", &commit[..12]))
+}
+
+pub fn commit_template(repo: &Path) -> Result<Option<String>, String> {
+    let configured = match run(repo, &["config", "--path", "--get", "commit.template"]) {
+        Ok(path) => path,
+        Err(error) if error.is_empty() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let path = if let Some(git_path) = configured
+        .strip_prefix(".git/")
+        .or_else(|| configured.strip_prefix(".git\\"))
+    {
+        PathBuf::from(run(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                git_path,
+            ],
+        )?)
+    } else {
+        let path = PathBuf::from(configured);
+        if path.is_absolute() {
+            path
+        } else {
+            repo.join(path)
+        }
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Could not read commit template {}: {error}", path.display()))?;
+    let marker = run(repo, &["config", "--get", "core.commentChar"])
+        .ok()
+        .filter(|value| !value.is_empty() && value != "auto")
+        .unwrap_or_else(|| "#".into());
+    let message = text
+        .lines()
+        .filter(|line| !line.trim_start().starts_with(&marker))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned();
+    Ok((!message.is_empty()).then_some(message))
+}
+
+pub fn message_with_coauthor(message: &str, name: &str, email: &str) -> Result<String, String> {
+    let mut message = message.trim_end().to_owned();
+    let name = name.trim();
+    let email = email.trim();
+    let valid_email = email.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+    });
+    if name.is_empty() && email.is_empty() {
+        return Ok(message);
+    }
+    if name.is_empty()
+        || name.contains(['\n', '\r', '<', '>'])
+        || email.is_empty()
+        || !valid_email
+        || email.contains(['\n', '\r', '<', '>', ' ', '\t'])
+    {
+        return Err("Enter a co-author name and email address".into());
+    }
+    let trailer = format!("Co-authored-by: {name} <{email}>");
+    if !message.lines().any(|line| line == trailer) {
+        if !message.is_empty() {
+            message.push_str("\n\n");
+        }
+        message.push_str(&trailer);
+    }
+    Ok(message)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RebaseAction {
     Pick,
@@ -1666,6 +1777,88 @@ mod tests {
     }
 
     #[test]
+    fn restores_clean_file_from_commit_and_refuses_local_edits() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-restore-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        let file = root.join("note.txt");
+        std::fs::write(&file, "old\n").unwrap();
+        run(&root, &["add", "note.txt"]).unwrap();
+        run(&root, &["commit", "-m", "Old"]).unwrap();
+        let old = run(&root, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(&file, "new\n").unwrap();
+        run(&root, &["add", "note.txt"]).unwrap();
+        run(&root, &["commit", "-m", "New"]).unwrap();
+        restore_file_from_commit(&root, &old, "note.txt").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "old\n"
+        );
+        assert_eq!(
+            run(&root, &["diff", "--cached", "--name-only"]).unwrap(),
+            "note.txt"
+        );
+        std::fs::write(&file, "local edit\n").unwrap();
+        assert!(restore_file_from_commit(&root, &old, "note.txt").is_err());
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "local edit\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_configured_commit_template_and_adds_coauthor_once() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-template-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        assert!(commit_template(&root).unwrap().is_none());
+        let template = PathBuf::from(
+            run(
+                &root,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "message.txt",
+                ],
+            )
+            .unwrap(),
+        );
+        std::fs::write(&template, "Subject\n\n# Instructions\nDetails\n").unwrap();
+        run(&root, &["config", "commit.template", ".git/message.txt"]).unwrap();
+        assert_eq!(
+            commit_template(&root).unwrap().as_deref(),
+            Some("Subject\n\nDetails")
+        );
+        let message = message_with_coauthor("Subject", "Alex", "alex@example.invalid").unwrap();
+        assert_eq!(
+            message,
+            "Subject\n\nCo-authored-by: Alex <alex@example.invalid>"
+        );
+        assert_eq!(
+            message_with_coauthor(&message, "Alex", "alex@example.invalid").unwrap(),
+            message
+        );
+        assert!(message_with_coauthor("Subject", "Alex", "bad email").is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn parses_status_with_spaces_and_rename() {
         let files =
             parse_status(b" M a file.txt\0R  new name.txt\0old name.txt\0?? new.txt\0").unwrap();
@@ -1727,6 +1920,16 @@ mod tests {
                 .canonicalize()
                 .unwrap(),
             worktree.canonicalize().unwrap()
+        );
+        std::fs::write(metadata.join("message.txt"), "External template\n").unwrap();
+        run(
+            &worktree,
+            &["config", "commit.template", ".git/message.txt"],
+        )
+        .unwrap();
+        assert_eq!(
+            commit_template(&worktree).unwrap().as_deref(),
+            Some("External template")
         );
         std::fs::remove_dir_all(base).unwrap();
     }

@@ -17,6 +17,8 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Export a commit or changed file as a patch and apply a patch from disk.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.
+- Restore a clean file from a selected commit into the working tree and staging area; local edits to that file block the restore.
+- Apply a configured commit template to a draft and add a co-author trailer from the commit form.
 - Cherry-pick and revert non-merge commits with confirmation.
 - Create and switch branches, track remote branches, merge branches, and create tags.
 - Add and remove remotes and create annotated tags.

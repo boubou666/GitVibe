@@ -322,6 +322,8 @@ enum Job {
     UndoIndex(git::IndexChange, bool),
     CheckMergeTarget(String),
     LoadLfs,
+    LoadCommitTemplate,
+    RestoreFile(String, String),
     SwitchBranch(String, bool, bool),
     Shell(String, PathBuf),
     LoadPullRequests,
@@ -358,6 +360,7 @@ enum Done {
     IndexMoved(String, Snapshot, git::IndexChange, bool),
     MergeChecked(Result<git::MergeCheck, String>),
     LfsLoaded(Result<Option<git::LfsStatus>, String>),
+    TemplateLoaded(PathBuf, Result<Option<String>, String>),
     Shell(Result<String, String>),
     PullRequests(Result<Vec<github::PullRequest>, String>),
     PullRequestCreated(Result<String, String>),
@@ -446,6 +449,10 @@ pub struct GitVibe {
     remote_name: String,
     remote_url: String,
     commit_message: String,
+    commit_template: Option<String>,
+    template_loaded_for: Option<PathBuf>,
+    coauthor_name: String,
+    coauthor_email: String,
     command_input: String,
     terminal_output: String,
     terminal_cwd: Option<PathBuf>,
@@ -489,6 +496,7 @@ pub struct GitVibe {
     confirm_discard_hunk: Option<String>,
     confirm_commit_action: Option<(CommitAction, String)>,
     confirm_checkout_commit: Option<String>,
+    confirm_restore_file: Option<(String, String)>,
     create_ref_at: Option<(RefAtKind, String)>,
     confirm_delete_ref: Option<RefDeletion>,
     confirm_remove_remote: Option<String>,
@@ -686,6 +694,10 @@ impl GitVibe {
             remote_name: String::new(),
             remote_url: String::new(),
             commit_message: String::new(),
+            commit_template: None,
+            template_loaded_for: None,
+            coauthor_name: String::new(),
+            coauthor_email: String::new(),
             command_input: String::new(),
             terminal_output: String::new(),
             terminal_cwd: None,
@@ -729,6 +741,7 @@ impl GitVibe {
             confirm_discard_hunk: None,
             confirm_commit_action: None,
             confirm_checkout_commit: None,
+            confirm_restore_file: None,
             create_ref_at: None,
             confirm_delete_ref: None,
             confirm_remove_remote: None,
@@ -916,6 +929,23 @@ impl GitVibe {
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|path| git::lfs_status(&path)),
                 ),
+                Job::LoadCommitTemplate => match repo {
+                    Some(path) => Done::TemplateLoaded(path.clone(), git::commit_template(&path)),
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
+                Job::RestoreFile(id, file) => match repo {
+                    Some(path) => {
+                        let result = git::restore_file_from_commit(&path, &id, &file);
+                        match git::snapshot_with_limit(&path, history_limit) {
+                            Ok(snapshot) => match result {
+                                Ok(output) => Done::Ran(Ok((output, snapshot))),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
                 Job::SwitchBranch(name, stash_first, remote) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
                         let mut output = String::new();
@@ -1086,6 +1116,12 @@ impl GitVibe {
                     self.merge_check = None;
                     self.merge_check_error.clear();
                     if self.repo.as_ref() != Some(&snapshot.root) {
+                        self.commit_message.clear();
+                        self.commit_template = None;
+                        self.template_loaded_for = None;
+                        self.coauthor_name.clear();
+                        self.coauthor_email.clear();
+                        self.confirm_restore_file = None;
                         self.lfs_status = None;
                         self.lfs_loaded_for = None;
                         self.lfs_error.clear();
@@ -1175,7 +1211,7 @@ impl GitVibe {
                     }
                     self.error.clear();
                     if self.committing {
-                        self.commit_message.clear();
+                        self.commit_message = self.commit_template.clone().unwrap_or_default();
                     }
                     self.committing = false;
                     if self.hunk_action
@@ -1353,6 +1389,19 @@ impl GitVibe {
                     self.lfs_error = error;
                 }
             },
+            Done::TemplateLoaded(repo, result) => {
+                if self.repo.as_ref() == Some(&repo) {
+                    match result {
+                        Ok(template) => {
+                            if self.commit_message.trim().is_empty() {
+                                self.commit_message = template.clone().unwrap_or_default();
+                            }
+                            self.commit_template = template;
+                        }
+                        Err(error) => self.error = error,
+                    }
+                }
+            }
             Done::IndexChanged(..) | Done::IndexMoved(..) => unreachable!(),
         }
     }
@@ -3132,12 +3181,46 @@ impl GitVibe {
                         .strong()
                         .color(accent()),
                 );
+                if let Some(template) = self.commit_template.clone()
+                    && ui
+                        .small_button("Apply configured template")
+                        .on_hover_text("Replace this draft with the Git commit.template content")
+                        .clicked()
+                {
+                    self.commit_message = template;
+                }
                 ui.add(
                     egui::TextEdit::multiline(&mut self.commit_message)
                         .hint_text("What changed? Write a clear commit message...")
                         .desired_width(ui.available_width())
                         .desired_rows(2),
                 );
+                ui.label(
+                    RichText::new("CO-AUTHOR  |  OPTIONAL")
+                        .size(10.0)
+                        .color(muted()),
+                );
+                let field_width = ((ui.available_width() - 6.0) / 2.0).max(90.0);
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.coauthor_name)
+                            .hint_text("Name")
+                            .desired_width(field_width),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.coauthor_email)
+                            .hint_text("Email")
+                            .desired_width(field_width),
+                    );
+                });
+                let message = git::message_with_coauthor(
+                    &self.commit_message,
+                    &self.coauthor_name,
+                    &self.coauthor_email,
+                );
+                if let Err(error) = &message {
+                    ui.colored_label(orange(), error);
+                }
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new(if snapshot.merge_in_progress && staged.is_empty() {
@@ -3151,7 +3234,10 @@ impl GitVibe {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
-                                !self.commit_message.trim().is_empty()
+                                !self.busy
+                                    && message
+                                        .as_ref()
+                                        .is_ok_and(|message| !message.trim().is_empty())
                                     && (!staged.is_empty() || snapshot.merge_in_progress)
                                     && conflicts.is_empty(),
                                 egui::Button::new(
@@ -3169,11 +3255,9 @@ impl GitVibe {
                             .clicked()
                         {
                             self.committing = true;
-                            self.git_owned(vec![
-                                "commit".into(),
-                                "-m".into(),
-                                self.commit_message.clone(),
-                            ]);
+                            if let Ok(message) = message {
+                                self.git_owned(vec!["commit".into(), "-m".into(), message]);
+                            }
                         }
                     });
                 });
@@ -5147,6 +5231,15 @@ impl GitVibe {
                                             file.path.clone(),
                                         ]));
                                     }
+                                    if file.status != "D"
+                                        && ui
+                                            .add_enabled(!self.busy, egui::Button::new("Restore…"))
+                                            .on_hover_text("Restore this version into the working file and stage it")
+                                            .clicked()
+                                    {
+                                        self.confirm_restore_file =
+                                            Some((commit.id.clone(), file.path.clone()));
+                                    }
                                 });
                             });
                     }
@@ -5907,6 +6000,40 @@ impl GitVibe {
                             self.git_owned(vec!["switch".into(), "--detach".into(), id]);
                             self.confirm_checkout_commit = None;
                             self.page = Page::History;
+                        }
+                    });
+                });
+        }
+        if let Some((id, path)) = self.confirm_restore_file.clone() {
+            let dirty = self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.status.iter().any(|file| file.path == path));
+            egui::Window::new("Restore file from commit?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Restore {path} from commit {}?",
+                        &id[..id.len().min(12)]
+                    ));
+                    ui.label("The selected version will replace the working file and be staged.");
+                    if dirty {
+                        ui.colored_label(
+                            orange(),
+                            "This file has local changes. Save, commit, or stash them first.",
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_restore_file = None;
+                        }
+                        if ui
+                            .add_enabled(!self.busy && !dirty, egui::Button::new("Restore file"))
+                            .clicked()
+                        {
+                            self.queue(Job::RestoreFile(id, path));
+                            self.confirm_restore_file = None;
                         }
                     });
                 });
@@ -6715,6 +6842,15 @@ impl eframe::App for GitVibe {
             });
         self.command_palette(&ctx);
         self.dialogs(&ctx);
+        if self.page == Page::Changes
+            && !self.busy
+            && self.pending.is_none()
+            && let Some(repo) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone())
+            && self.template_loaded_for.as_ref() != Some(&repo)
+        {
+            self.template_loaded_for = Some(repo);
+            self.queue(Job::LoadCommitTemplate);
+        }
         self.launch(&ctx);
     }
 }
