@@ -306,6 +306,7 @@ pub struct GitVibe {
     interactive_plan: Option<git::RebasePlan>,
     confirm_interactive_rebase: bool,
     diff_wrap: bool,
+    diff_split: bool,
     diff_hunk_focus: usize,
     diff_scroll_pending: bool,
     pr_base: String,
@@ -358,6 +359,7 @@ pub struct GitVibe {
     create_ref_at: Option<(RefAtKind, String)>,
     confirm_delete_ref: Option<RefDeletion>,
     confirm_remove_remote: Option<String>,
+    edit_remote: Option<(String, String)>,
     confirm_reset: Option<String>,
     confirm_conflict_side: Option<(String, git::ConflictSide)>,
     confirm_abort_merge: bool,
@@ -518,6 +520,7 @@ impl GitVibe {
             interactive_plan: None,
             confirm_interactive_rebase: false,
             diff_wrap: false,
+            diff_split: false,
             diff_hunk_focus: 0,
             diff_scroll_pending: false,
             pr_base: "main".to_owned(),
@@ -570,6 +573,7 @@ impl GitVibe {
             create_ref_at: None,
             confirm_delete_ref: None,
             confirm_remove_remote: None,
+            edit_remote: None,
             confirm_reset: None,
             confirm_conflict_side: None,
             confirm_abort_merge: false,
@@ -1566,6 +1570,13 @@ impl GitVibe {
                             } else if response.clicked() {
                                 self.focus_ref(&branch.target);
                             }
+                            response.context_menu(|ui| {
+                                if ui.button("Create worktree from branch").clicked() {
+                                    self.worktree_ref = branch.name.clone();
+                                    self.page = Page::Worktrees;
+                                    ui.close();
+                                }
+                            });
                         }
                     });
             }
@@ -1576,6 +1587,13 @@ impl GitVibe {
                 } else if response.clicked() {
                     self.focus_ref(&branch.target);
                 }
+                response.context_menu(|ui| {
+                    if ui.button("Create worktree from branch").clicked() {
+                        self.worktree_ref = branch.name.clone();
+                        self.page = Page::Worktrees;
+                        ui.close();
+                    }
+                });
             }
         });
 
@@ -1631,6 +1649,13 @@ impl GitVibe {
                                     } else if response.clicked() {
                                         self.focus_ref(&branch.target);
                                     }
+                                    response.context_menu(|ui| {
+                                        if ui.button("Create worktree from branch").clicked() {
+                                            self.worktree_ref = branch.name.clone();
+                                            self.page = Page::Worktrees;
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             });
                         }
@@ -1642,6 +1667,13 @@ impl GitVibe {
                             } else if response.clicked() {
                                 self.focus_ref(&branch.target);
                             }
+                            response.context_menu(|ui| {
+                                if ui.button("Create worktree from branch").clicked() {
+                                    self.worktree_ref = branch.name.clone();
+                                    self.page = Page::Worktrees;
+                                    ui.close();
+                                }
+                            });
                         }
                     });
             }
@@ -1649,6 +1681,61 @@ impl GitVibe {
 
         ui.add_space(10.0);
         ui.separator();
+        if snapshot.worktrees.len() > 1 {
+            egui::CollapsingHeader::new(
+                RichText::new(format!("WORKTREES  {}", snapshot.worktrees.len()))
+                    .size(10.5)
+                    .strong()
+                    .color(text()),
+            )
+            .id_salt("sidebar_worktrees")
+            .default_open(true)
+            .show(ui, |ui| {
+                for worktree in &snapshot.worktrees {
+                    let name = worktree.branch.as_deref().unwrap_or("Detached HEAD");
+                    let changes = worktree
+                        .dirty_count
+                        .map(|count| format!(" · {count} changes"))
+                        .unwrap_or_default();
+                    let short_name = if name.chars().count() > 19 {
+                        format!("{}…", name.chars().take(18).collect::<String>())
+                    } else {
+                        name.to_owned()
+                    };
+                    let label = format!(
+                        "{}{}{}",
+                        if worktree.current { "✓ " } else { "" },
+                        short_name,
+                        changes
+                    );
+                    if (filter.is_empty() || name.to_lowercase().contains(&filter))
+                        && ui
+                            .add_enabled(
+                                !worktree.prunable,
+                                egui::Button::new(RichText::new(label).size(11.0).color(
+                                    if worktree.dirty_count.unwrap_or(0) > 0 {
+                                        orange()
+                                    } else {
+                                        muted()
+                                    },
+                                ))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                            )
+                            .on_hover_text(worktree.path.display().to_string())
+                            .clicked()
+                    {
+                        if worktree.current {
+                            self.page = Page::Worktrees;
+                        } else {
+                            self.queue(Job::Open(worktree.path.clone()));
+                        }
+                    }
+                }
+            });
+            ui.add_space(10.0);
+            ui.separator();
+        }
         egui::CollapsingHeader::new(
             RichText::new(format!("TAGS  {}", snapshot.tags.len()))
                 .size(10.5)
@@ -1760,6 +1847,34 @@ impl GitVibe {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("View changes").clicked() {
                                 self.page = Page::Changes;
+                            }
+                        });
+                    });
+                });
+        }
+        for worktree in snapshot
+            .worktrees
+            .iter()
+            .filter(|worktree| !worktree.current && worktree.dirty_count.unwrap_or(0) > 0)
+        {
+            egui::Frame::new()
+                .fill(Color32::from_rgb(39, 50, 69))
+                .inner_margin(egui::Margin::symmetric(8, 3))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("WIP").size(10.0).strong().color(orange()));
+                        ui.label(
+                            RichText::new(format!(
+                                "{} changed files in {}",
+                                worktree.dirty_count.unwrap_or(0),
+                                worktree.branch.as_deref().unwrap_or("detached worktree")
+                            ))
+                            .size(11.0)
+                            .color(text()),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Open worktree").clicked() {
+                                self.queue(Job::Open(worktree.path.clone()));
                             }
                         });
                     });
@@ -2123,6 +2238,10 @@ impl GitVibe {
         }
         ui.add_space(8.0);
         ui.separator();
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.diff_split, false, "Unified");
+            ui.selectable_value(&mut self.diff_split, true, "Side by side");
+        });
         if self.detail.is_empty() {
             ui.label(RichText::new("Loading commit diff...").color(muted()));
         } else {
@@ -2180,10 +2299,16 @@ impl GitVibe {
                                                 .color(violet()),
                                         );
                                     });
-                                let numbers = hunk.line_numbers();
-                                for (i, line) in hunk.lines.iter().enumerate() {
-                                    let (old, new) = numbers[i];
-                                    diff_line_numbered(ui, line, old, new, None, false);
+                                if self.diff_split {
+                                    for row in hunk.split_rows() {
+                                        split_diff_row(ui, &row);
+                                    }
+                                } else {
+                                    let numbers = hunk.line_numbers();
+                                    for (i, line) in hunk.lines.iter().enumerate() {
+                                        let (old, new) = numbers[i];
+                                        diff_line_numbered(ui, line, old, new, None, false);
+                                    }
                                 }
                             }
                         });
@@ -2525,6 +2650,7 @@ impl GitVibe {
         let local_names = branches.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
         let remote_branches = snapshot.remote_branches.clone();
         let remotes = snapshot.remotes.clone();
+        let remote_urls = snapshot.remote_urls.clone();
         let tags = snapshot.tags.clone();
         egui::Frame::new()
             .fill(panel_alt())
@@ -2763,6 +2889,18 @@ impl GitVibe {
                 for remote in remotes {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&remote).color(text()));
+                        let url = remote_urls.get(&remote).cloned().unwrap_or_default();
+                        ui.add_sized(
+                            [280.0, 22.0],
+                            egui::Label::new(RichText::new(&url).small().color(muted())).truncate(),
+                        )
+                        .on_hover_text(&url);
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Edit URL..."))
+                            .clicked()
+                        {
+                            self.edit_remote = Some((remote.clone(), url));
+                        }
                         if ui
                             .add_enabled(!self.busy, egui::Button::new("Remove..."))
                             .clicked()
@@ -2887,6 +3025,16 @@ impl GitVibe {
                                         RichText::new("Missing folder; metadata can be pruned")
                                             .small()
                                             .color(orange()),
+                                    );
+                                }
+                                if let Some(count) = worktree.dirty_count.filter(|count| *count > 0)
+                                {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{count} file changes in this worktree"
+                                        ))
+                                        .small()
+                                        .color(orange()),
                                     );
                                 }
                             });
@@ -3900,7 +4048,11 @@ impl GitVibe {
         });
         let hunk_count = git::diff_hunks(&self.detail).len();
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.diff_wrap, "Wrap lines");
+            ui.selectable_value(&mut self.diff_split, false, "Unified");
+            ui.selectable_value(&mut self.diff_split, true, "Side by side");
+            ui.add_enabled_ui(!self.diff_split, |ui| {
+                ui.checkbox(&mut self.diff_wrap, "Wrap lines");
+            });
             if hunk_count > 0 {
                 ui.separator();
                 if ui
@@ -4371,13 +4523,16 @@ impl GitVibe {
             } else {
                 Vec::new()
             };
-            let scroll = if self.diff_wrap {
+            let scroll = if self.diff_wrap && !self.diff_split {
                 egui::ScrollArea::vertical()
             } else {
                 egui::ScrollArea::both()
             };
             scroll.show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.y = 2.0;
+                if self.diff_split {
+                    ui.set_min_width(840.0);
+                }
                 if hunks.is_empty() {
                     for line in self.detail.lines().take(2500) {
                         diff_line(ui, line);
@@ -4438,55 +4593,71 @@ impl GitVibe {
                             ui.scroll_to_rect(heading.response.rect, Some(egui::Align::Center));
                             self.diff_scroll_pending = false;
                         }
-                        let numbers = hunk.line_numbers();
-                        for (index, line) in hunk.lines.iter().enumerate().take(400) {
-                            let counterpart = if line.starts_with('+') {
-                                index
-                                    .checked_sub(1)
-                                    .and_then(|i| hunk.lines.get(i))
-                                    .filter(|other| other.starts_with('-'))
-                                    .map(String::as_str)
-                            } else if line.starts_with('-') {
-                                hunk.lines
-                                    .get(index + 1)
-                                    .filter(|other| other.starts_with('+'))
-                                    .map(String::as_str)
-                            } else {
-                                None
-                            };
-                            let row_y = ui.cursor().top();
-                            let row_hovered = ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
-                                pointer.y >= row_y && pointer.y < row_y + 24.0
-                            });
-                            ui.horizontal(|ui| {
-                                if let Some(patch) = hunk.line_patch(index) {
-                                    if row_hovered
-                                        && ui
-                                            .add_enabled(
-                                                !self.busy,
-                                                egui::Button::new(if self.selected_file_staged {
-                                                    "Unstage"
-                                                } else {
-                                                    "Stage"
-                                                })
-                                                .small(),
-                                            )
-                                            .clicked()
-                                    {
-                                        self.hunk_action = true;
-                                        self.queue(Job::ApplyLine(
-                                            patch,
-                                            self.selected_file_staged,
-                                        ));
-                                    } else if !row_hovered {
+                        if self.diff_split {
+                            for row in hunk.split_rows().into_iter().take(400) {
+                                split_diff_row(ui, &row);
+                            }
+                        } else {
+                            let numbers = hunk.line_numbers();
+                            for (index, line) in hunk.lines.iter().enumerate().take(400) {
+                                let counterpart = if line.starts_with('+') {
+                                    index
+                                        .checked_sub(1)
+                                        .and_then(|i| hunk.lines.get(i))
+                                        .filter(|other| other.starts_with('-'))
+                                        .map(String::as_str)
+                                } else if line.starts_with('-') {
+                                    hunk.lines
+                                        .get(index + 1)
+                                        .filter(|other| other.starts_with('+'))
+                                        .map(String::as_str)
+                                } else {
+                                    None
+                                };
+                                let row_y = ui.cursor().top();
+                                let row_hovered =
+                                    ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
+                                        pointer.y >= row_y && pointer.y < row_y + 24.0
+                                    });
+                                ui.horizontal(|ui| {
+                                    if let Some(patch) = hunk.line_patch(index) {
+                                        if row_hovered
+                                            && ui
+                                                .add_enabled(
+                                                    !self.busy,
+                                                    egui::Button::new(
+                                                        if self.selected_file_staged {
+                                                            "Unstage"
+                                                        } else {
+                                                            "Stage"
+                                                        },
+                                                    )
+                                                    .small(),
+                                                )
+                                                .clicked()
+                                        {
+                                            self.hunk_action = true;
+                                            self.queue(Job::ApplyLine(
+                                                patch,
+                                                self.selected_file_staged,
+                                            ));
+                                        } else if !row_hovered {
+                                            ui.add_space(51.0);
+                                        }
+                                    } else {
                                         ui.add_space(51.0);
                                     }
-                                } else {
-                                    ui.add_space(51.0);
-                                }
-                                let (old, new) = numbers[index];
-                                diff_line_numbered(ui, line, old, new, counterpart, self.diff_wrap);
-                            });
+                                    let (old, new) = numbers[index];
+                                    diff_line_numbered(
+                                        ui,
+                                        line,
+                                        old,
+                                        new,
+                                        counterpart,
+                                        self.diff_wrap,
+                                    );
+                                });
+                            }
                         }
                         ui.add_space(9.0);
                     }
@@ -5280,6 +5451,39 @@ impl GitVibe {
                     });
                 });
         }
+        if let Some((name, mut url)) = self.edit_remote.clone() {
+            let mut cancel = false;
+            let mut save = false;
+            egui::Window::new(format!("Edit {name} URL"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Fetch and push URL");
+                    ui.add(egui::TextEdit::singleline(&mut url).desired_width(480.0));
+                    ui.horizontal(|ui| {
+                        cancel = ui.button("Cancel").clicked();
+                        save = ui
+                            .add_enabled(
+                                !self.busy && !url.trim().is_empty() && !url.contains(['\r', '\n']),
+                                egui::Button::new("Save URL"),
+                            )
+                            .clicked();
+                    });
+                });
+            if save {
+                self.git_owned(vec![
+                    "remote".into(),
+                    "set-url".into(),
+                    name,
+                    url.trim().to_owned(),
+                ]);
+                self.edit_remote = None;
+            } else if cancel {
+                self.edit_remote = None;
+            } else {
+                self.edit_remote = Some((name, url));
+            }
+        }
         if let Some(remote) = self.confirm_remove_remote.clone() {
             egui::Window::new("Remove remote?")
                 .collapsible(false)
@@ -5607,6 +5811,45 @@ fn diff_line(ui: &mut egui::Ui, line: &str) {
     ui.add(
         egui::Label::new(RichText::new(line).monospace().size(11.0).color(color)).selectable(true),
     );
+}
+
+fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow) {
+    ui.columns(2, |columns| {
+        if let Some(old) = &row.old {
+            let counterpart = if old.line.starts_with('-') {
+                row.new.as_ref().map(|side| side.line.as_str())
+            } else {
+                None
+            };
+            diff_line_numbered(
+                &mut columns[0],
+                &old.line,
+                Some(old.number),
+                None,
+                counterpart,
+                false,
+            );
+        } else {
+            columns[0].add_space(18.0);
+        }
+        if let Some(new) = &row.new {
+            let counterpart = if new.line.starts_with('+') {
+                row.old.as_ref().map(|side| side.line.as_str())
+            } else {
+                None
+            };
+            diff_line_numbered(
+                &mut columns[1],
+                &new.line,
+                None,
+                Some(new.number),
+                counterpart,
+                false,
+            );
+        } else {
+            columns[1].add_space(18.0);
+        }
+    });
 }
 
 fn diff_line_numbered(

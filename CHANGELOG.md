@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-30
+
+### Added
+
+- Side by side diff mode for working-tree files and commit patches, with aligned old and new line numbers and replacement highlights.
+- Worktrees in the branch rail with per-worktree change counts, plus separate WIP rows in history and branch context actions to start a worktree.
+- Remote URL editing from the Branches & tags screen.
+
 ## [0.8.0] - 2026-09-30
 
 ### Added
