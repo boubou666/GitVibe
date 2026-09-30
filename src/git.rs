@@ -1088,13 +1088,18 @@ fn apply_patch(repo: &Path, patch: &str, reverse: bool, zero_context: bool) -> R
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let command = Command::new("git");
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
+        let mut command = command;
         command.creation_flags(0x0800_0000);
+        command
     }
-    command
+    #[cfg(not(target_os = "windows"))]
+    {
+        command
+    }
 }
 
 fn git_output(repo: Option<&Path>, args: &[&str]) -> Result<Output, String> {
