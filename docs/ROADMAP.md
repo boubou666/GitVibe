@@ -86,6 +86,14 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 4. Add multi-file selection and contextual stage, unstage, stash, discard, and patch actions; show inline stage controls on hover and open the selected file in the system file manager.
 5. Improve hovered tabs, changed-file rows, the commit-details working-tree card, and the organization of file diff controls.
 
+## Completed in 0.19.1
+
+1. Restyle first-launch profile setup and text-entry dialogs, with clearer input borders, spacing, and primary actions.
+2. Replace ambiguous Undo, Redo, and Refresh glyphs and the unsupported Preferences back arrow with drawn icons.
+3. Make the command palette dismiss on outside clicks, add spacing to history search, and show hover feedback on commit-detail files.
+4. Keep inline Stage and Unstage buttons visible while hovered and execute their action directly.
+5. Keep long paths from expanding the resizable details pane; show the complete path in a tooltip and align Restore actions to the right.
+
 ## Next: GitKraken workflow parity
 
 1. **Broader undo and redo.** Extend explicit recovery data beyond staging and ordinary unpublished commits to other safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).

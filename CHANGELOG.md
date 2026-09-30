@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-30
+
+### Improved
+
+- Restyle first-run profile setup and text-entry dialogs with roomier fields, consistent spacing, and clearer primary actions.
+- Draw distinct Undo, Redo, Refresh, and Back to workspace arrows instead of relying on missing font glyphs or ambiguous ring icons.
+
+### Fixed
+
+- Close the command palette on outside clicks and show readable keyboard hints.
+- Give the history search controls space above and below the row.
+- Highlight hovered files in commit details and keep the inline Stage or Unstage button stable under the pointer. Clicking it now performs the operation without opening file details.
+- Keep the resizable details pane within its chosen width, truncate long changed-file paths with the full path on hover, and align Restore buttons at the pane's right edge.
+
 ## [0.19.0] - 2026-09-30
 
 ### Added
@@ -224,7 +238,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/boubou666/GitVibe/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/boubou666/GitVibe/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/boubou666/GitVibe/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/boubou666/GitVibe/compare/v0.16.0...v0.17.0
