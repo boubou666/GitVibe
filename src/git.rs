@@ -1614,10 +1614,11 @@ mod tests {
             && tree.branch.as_deref() == Some("linked-test")));
         assert_eq!(listed.iter().filter(|tree| tree.current).count(), 1);
         assert!(linked.join(".git").is_file());
+        let linked_identity = linked.canonicalize().unwrap();
         assert_eq!(
             listed
                 .iter()
-                .find(|tree| tree.path == linked)
+                .find(|tree| tree.path.canonicalize().ok().as_ref() == Some(&linked_identity))
                 .and_then(|tree| tree.dirty_count),
             Some(0)
         );
@@ -1626,7 +1627,7 @@ mod tests {
             worktrees(&root)
                 .unwrap()
                 .iter()
-                .find(|tree| tree.path == linked)
+                .find(|tree| tree.path.canonicalize().ok().as_ref() == Some(&linked_identity))
                 .and_then(|tree| tree.dirty_count),
             Some(1)
         );
