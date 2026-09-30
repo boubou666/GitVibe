@@ -21,7 +21,7 @@ const PANEL_ALT: Color32 = Color32::from_rgb(48, 52, 63);
 const ELEVATED: Color32 = Color32::from_rgb(53, 70, 99);
 const BORDER: Color32 = Color32::from_rgb(62, 68, 80);
 const TEXT: Color32 = Color32::from_rgb(234, 238, 245);
-const MUTED: Color32 = Color32::from_rgb(155, 166, 184);
+const MUTED: Color32 = Color32::from_rgb(174, 184, 201);
 const ACCENT: Color32 = Color32::from_rgb(61, 196, 230);
 const ORANGE: Color32 = Color32::from_rgb(255, 177, 96);
 const RED: Color32 = Color32::from_rgb(255, 111, 134);
@@ -1423,7 +1423,7 @@ impl GitVibe {
                     ) {
                         self.run_pull_mode();
                     }
-                    ui.menu_button("v", |ui| {
+                    let pull_menu = ui.menu_button("v", |ui| {
                         ui.label(
                             RichText::new("Default pull action")
                                 .size(11.0)
@@ -1443,6 +1443,13 @@ impl GitVibe {
                                 ui.close();
                             }
                         }
+                    });
+                    pull_menu.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            "Choose default pull action",
+                        )
                     });
                     if toolbar_action(ui, "Push") {
                         self.git(&["push"]);
@@ -1796,11 +1803,13 @@ impl GitVibe {
                 }
             }
             ui.add_space(5.0);
-            if ui
+            let new_tab = ui
                 .add(egui::Button::new(RichText::new("+").size(17.0).color(text())).frame(false))
-                .on_hover_text("New tab")
-                .clicked()
-            {
+                .on_hover_text("New tab");
+            new_tab.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New tab")
+            });
+            if new_tab.clicked() {
                 self.new_tab_open = true;
                 self.page = Page::NewTab;
             }
@@ -6871,6 +6880,7 @@ fn workspace_tab(
     width: f32,
 ) -> (bool, bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
     let fill = if selected { bg() } else { panel_alt() };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().line_segment(
@@ -6903,6 +6913,9 @@ fn workspace_tab(
         let close_response = ui
             .interact(close_rect, id.with("close"), egui::Sense::click())
             .on_hover_text("Close tab");
+        close_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Close {title} tab"))
+        });
         if close_response.hovered() {
             ui.painter().rect_filled(close_rect, 3.0, elevated());
         }
@@ -6933,6 +6946,7 @@ fn sidebar_branch_row(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
     if selected {
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(48, 87, 66));

@@ -44,6 +44,7 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 
 1. File-aware syntax highlighting for unified and side by side diffs, retaining parser state within each old and new hunk stream.
 2. Keyboard navigation through changed files with Alt+Up and Alt+Down.
+3. Native AccessKit bridge, labels for custom-painted tabs and branch rows, and improved Aurora muted-text contrast.
 
 ## Next: GitKraken workflow parity
 
