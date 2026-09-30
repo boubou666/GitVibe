@@ -6235,62 +6235,23 @@ impl GitVibe {
                     let files = self.commit_files.clone();
                     for file in files {
                         let selected = self.selected_commit_file.as_deref() == Some(&file.path);
-                        let background = ui.painter().add(egui::Shape::Noop);
-                        let row = egui::Frame::new()
-                            .inner_margin(egui::Margin::symmetric(6, 2))
-                            .show(ui, |ui| {
-                                ui.set_min_width(ui.available_width());
-                                ui.horizontal(|ui| {
-                                    let status_color = match file.status.as_str() {
-                                        "A" => accent(),
-                                        "D" => red(),
-                                        _ => orange(),
-                                    };
-                                    ui.label(
-                                        RichText::new(&file.status)
-                                            .monospace()
-                                            .strong()
-                                            .color(status_color),
-                                    );
-                                    if ui
-                                        .add(
-                                            egui::Button::new(
-                                                RichText::new(&file.path).size(11.0).color(text()),
-                                            )
-                                            .fill(Color32::TRANSPARENT)
-                                            .stroke(Stroke::NONE),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_commit_file = Some(file.path.clone());
-                                        self.page = Page::CommitDiff;
-                                        self.detail.clear();
-                                        self.queue(Job::Inspect(vec![
-                                            "show".into(),
-                                            "--format=".into(),
-                                            "--patch".into(),
-                                            "--no-color".into(),
-                                            commit.id.clone(),
-                                            "--".into(),
-                                            file.path.clone(),
-                                        ]));
-                                    }
-                                    if file.status != "D"
-                                        && ui
-                                            .add_enabled(!self.busy, egui::Button::new("Restore…"))
-                                            .on_hover_text("Restore this version into the working file and stage it")
-                                            .clicked()
-                                    {
-                                        self.confirm_restore_file =
-                                            Some((commit.id.clone(), file.path.clone()));
-                                    }
-                                });
-                            });
+                        let (rect, row) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 32.0),
+                            egui::Sense::click(),
+                        );
+                        row.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Button,
+                                true,
+                                selected,
+                                &file.path,
+                            )
+                        });
                         let hovered = ui.input(|input| {
                             input
                                 .pointer
                                 .hover_pos()
-                                .is_some_and(|position| row.response.rect.contains(position))
+                                .is_some_and(|position| rect.contains(position))
                         });
                         let fill = if selected && hovered {
                             elevated().gamma_multiply(1.2)
@@ -6301,10 +6262,100 @@ impl GitVibe {
                         } else {
                             Color32::TRANSPARENT
                         };
-                        ui.painter().set(
-                            background,
-                            egui::Shape::rect_filled(row.response.rect, 4.0, fill),
+                        ui.painter().rect_filled(rect, 4.0, fill);
+                        let status_color = match file.status.as_str() {
+                            "A" => accent(),
+                            "D" => red(),
+                            _ => orange(),
+                        };
+                        ui.painter().text(
+                            egui::pos2(rect.left() + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &file.status,
+                            egui::FontId::monospace(11.0),
+                            status_color,
                         );
+                        let restore_rect = egui::Rect::from_min_size(
+                            egui::pos2(rect.right() - 90.0, rect.center().y - 12.0),
+                            egui::vec2(86.0, 24.0),
+                        );
+                        let path_right = if file.status == "D" {
+                            rect.right() - 8.0
+                        } else {
+                            restore_rect.left() - 8.0
+                        };
+                        let path_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 29.0, rect.top()),
+                            egui::pos2(path_right, rect.bottom()),
+                        );
+                        let font = egui::FontId::proportional(11.0);
+                        let path_width = ui
+                            .painter()
+                            .layout_no_wrap(file.path.clone(), font.clone(), text())
+                            .size()
+                            .x;
+                        let truncated = path_width > path_rect.width();
+                        let visible_rect = if truncated {
+                            egui::Rect::from_min_max(
+                                path_rect.min,
+                                egui::pos2(path_rect.right() - 10.0, path_rect.bottom()),
+                            )
+                        } else {
+                            path_rect
+                        };
+                        ui.painter().with_clip_rect(visible_rect).text(
+                            egui::pos2(path_rect.left(), rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            &file.path,
+                            font.clone(),
+                            text(),
+                        );
+                        if truncated {
+                            ui.painter().text(
+                                egui::pos2(path_rect.right() - 10.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                "…",
+                                font,
+                                text(),
+                            );
+                        }
+                        if hovered {
+                            row.clone().on_hover_text(&file.path);
+                        }
+                        let restore_clicked = file.status != "D"
+                            && ui
+                                .add_enabled_ui(!self.busy, |ui| {
+                                    ui.put(restore_rect, egui::Button::new("Restore…"))
+                                })
+                                .inner
+                                .on_hover_text(
+                                    "Restore this version into the working file and stage it",
+                                )
+                                .clicked();
+                        let restore_target = file.status != "D"
+                            && ui.input(|input| {
+                                input
+                                    .pointer
+                                    .interact_pos()
+                                    .is_some_and(|position| restore_rect.contains(position))
+                            });
+                        if restore_clicked {
+                            self.confirm_restore_file =
+                                Some((commit.id.clone(), file.path.clone()));
+                        } else if row.clicked() && !restore_target {
+                            self.selected_commit_file = Some(file.path.clone());
+                            self.page = Page::CommitDiff;
+                            self.detail.clear();
+                            self.queue(Job::Inspect(vec![
+                                "show".into(),
+                                "--format=".into(),
+                                "--patch".into(),
+                                "--no-color".into(),
+                                commit.id.clone(),
+                                "--".into(),
+                                file.path.clone(),
+                            ]));
+                        }
                     }
                 }
             }
@@ -7861,6 +7912,7 @@ impl eframe::App for GitVibe {
                 .resizable(true)
                 .default_size(340.0)
                 .min_size(260.0)
+                .max_size((ui.available_width() * 0.48).max(340.0))
                 .frame(
                     egui::Frame::new()
                         .fill(panel())

@@ -92,6 +92,7 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 2. Replace ambiguous Undo, Redo, and Refresh glyphs and the unsupported Preferences back arrow with drawn icons.
 3. Make the command palette dismiss on outside clicks, add spacing to history search, and show hover feedback on commit-detail files.
 4. Keep inline Stage and Unstage buttons visible while hovered and execute their action directly.
+5. Keep long paths from expanding the resizable details pane; show the complete path in a tooltip and align Restore actions to the right.
 
 ## Next: GitKraken workflow parity
 

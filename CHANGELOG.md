@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Close the command palette on outside clicks and show readable keyboard hints.
 - Give the history search controls space above and below the row.
 - Highlight hovered files in commit details and keep the inline Stage or Unstage button stable under the pointer. Clicking it now performs the operation without opening file details.
+- Keep the resizable details pane within its chosen width, truncate long changed-file paths with the full path on hover, and align Restore buttons at the pane's right edge.
 
 ## [0.19.0] - 2026-09-30
 
