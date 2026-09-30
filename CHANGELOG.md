@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-30
+
+### Added
+
+- Refresh repository status and the selected working-tree diff automatically while a repository is open. The refresh runs in the background and follows external file edits without a manual click.
+- Undo and redo a newly created, unpublished local commit while preserving the index and working files. Replay checks the repository, branch, HEAD, index, and remote-tracking refs before moving the branch.
+- A new GitVibe ribbon icon for the app window, Windows executable and installer, macOS app bundle, and Linux desktop package.
+- A rotating local diagnostic log for app errors and panics, with an Open log folder control on the Updates screen. Remote URL credentials are redacted from recorded messages.
+
+### Improved
+
+- Keep long lines inside their side of the split diff and wrap them for readable side by side comparisons.
+- Use a dark, branded Windows installer wizard and launch the Windows app without a console window.
+
 ## [0.16.0] - 2026-09-30
 
 ### Improved

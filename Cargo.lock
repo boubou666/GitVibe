@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "gitvibe"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "eframe",
  "rfd",
@@ -1326,6 +1326,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "syntect",
+ "time",
  "ureq",
 ]
 

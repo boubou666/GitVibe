@@ -1,6 +1,6 @@
 [package]
 name = "gitvibe"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 description = "A native Git desktop client built in Rust"
 license = "MIT"
@@ -13,6 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 syntect = { version = "=5.3.0", default-features = false, features = ["default-fancy"] }
+time = { version = "0.3", features = ["formatting"] }
 ureq = "=3.4.2"
 
 [profile.release]

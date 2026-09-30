@@ -7,11 +7,12 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
     git::{self, Snapshot},
-    github, syntax, updates,
+    github, logging, syntax, updates,
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 
@@ -186,8 +187,8 @@ enum PaletteAction {
     UnstageSelected,
     StageAll,
     UnstageAll,
-    UndoIndex,
-    RedoIndex,
+    UndoLast,
+    RedoLast,
 }
 
 impl PaletteAction {
@@ -209,8 +210,8 @@ impl PaletteAction {
                 | Self::UnstageSelected
                 | Self::StageAll
                 | Self::UnstageAll
-                | Self::UndoIndex
-                | Self::RedoIndex
+                | Self::UndoLast
+                | Self::RedoLast
         )
     }
 }
@@ -242,10 +243,10 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ),
     ("Stage all changes", PaletteAction::StageAll),
     ("Unstage all changes", PaletteAction::UnstageAll),
-    ("Undo staging change · Ctrl/Cmd+Z", PaletteAction::UndoIndex),
+    ("Undo latest action · Ctrl/Cmd+Z", PaletteAction::UndoLast),
     (
-        "Redo staging change · Ctrl/Cmd+Shift+Z",
-        PaletteAction::RedoIndex,
+        "Redo latest action · Ctrl/Cmd+Shift+Z or Ctrl/Cmd+Y",
+        PaletteAction::RedoLast,
     ),
     ("Refresh repository", PaletteAction::Refresh),
     ("Fetch all", PaletteAction::Fetch),
@@ -319,7 +320,7 @@ enum Job {
     Init(PathBuf),
     Clone(String, PathBuf, bool, bool),
     Run(Vec<String>),
-    UndoIndex(git::IndexChange, bool),
+    Undo(UndoAction, bool),
     CheckMergeTarget(String),
     LoadLfs,
     LoadCommitTemplate,
@@ -353,6 +354,29 @@ enum Job {
 }
 
 type DiffColors = HashMap<(String, String), syntax::HunkColors>;
+type ChangedDiff = (String, bool, String, DiffColors);
+type WatchResult = Result<(Snapshot, Option<ChangedDiff>), String>;
+
+#[derive(Clone)]
+enum UndoAction {
+    Index(git::IndexChange),
+    Commit(git::CommitChange),
+}
+
+impl UndoAction {
+    fn label(&self) -> &str {
+        match self {
+            Self::Index(change) => &change.label,
+            Self::Commit(change) => &change.label,
+        }
+    }
+}
+
+struct Watched {
+    repo: PathBuf,
+    generation: u64,
+    result: WatchResult,
+}
 
 enum Done {
     Loaded(Result<Snapshot, String>),
@@ -360,6 +384,8 @@ enum Done {
     RanFailed(String, Snapshot),
     IndexChanged(String, Snapshot, Option<git::IndexChange>),
     IndexMoved(String, Snapshot, git::IndexChange, bool),
+    CommitChanged(String, Snapshot, Option<git::CommitChange>),
+    CommitMoved(String, Snapshot, git::CommitChange, bool),
     MergeChecked(Result<git::MergeCheck, String>),
     LfsLoaded(Result<Option<git::LfsStatus>, String>),
     TemplateLoaded(PathBuf, Result<Option<String>, String>),
@@ -476,14 +502,15 @@ pub struct GitVibe {
     output: String,
     notice: String,
     error: String,
+    last_logged_errors: HashMap<&'static str, String>,
     search: String,
     palette_open: bool,
     palette_query: String,
     palette_index: usize,
     palette_focus: bool,
     graph_scroll_pending: bool,
-    undo_stack: Vec<git::IndexChange>,
-    redo_stack: Vec<git::IndexChange>,
+    undo_stack: Vec<UndoAction>,
+    redo_stack: Vec<UndoAction>,
     search_results: Vec<git::Commit>,
     search_more: bool,
     search_active: bool,
@@ -491,6 +518,9 @@ pub struct GitVibe {
     file_history: Vec<git::Commit>,
     conflict_editor: Option<git::ConflictDocument>,
     receiver: Option<Receiver<Done>>,
+    watch_receiver: Option<Receiver<Watched>>,
+    watch_started: Instant,
+    watch_generation: u64,
     pending: Option<Job>,
     busy: bool,
     show_clone: bool,
@@ -721,6 +751,7 @@ impl GitVibe {
             output: String::new(),
             notice: String::new(),
             error: String::new(),
+            last_logged_errors: HashMap::new(),
             search: String::new(),
             palette_open: false,
             palette_query: String::new(),
@@ -736,6 +767,9 @@ impl GitVibe {
             file_history: Vec::new(),
             conflict_editor: None,
             receiver: None,
+            watch_receiver: None,
+            watch_started: Instant::now(),
+            watch_generation: 0,
             pending: None,
             busy: false,
             show_clone: false,
@@ -797,8 +831,17 @@ impl GitVibe {
         let Some(receiver) = &self.update_receiver else {
             return;
         };
-        let Ok(done) = receiver.try_recv() else {
-            return;
+        let done = match receiver.try_recv() {
+            Ok(done) => done,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.update_receiver = None;
+                self.update_state = UpdateState::Failed(
+                    "Update worker stopped unexpectedly. Open the diagnostic log for details."
+                        .into(),
+                );
+                return;
+            }
         };
         self.update_receiver = None;
         self.update_state = match done {
@@ -817,6 +860,7 @@ impl GitVibe {
 
     fn queue(&mut self, job: Job) {
         if !self.busy {
+            self.watch_generation = self.watch_generation.wrapping_add(1);
             self.notice.clear();
             if matches!(&job, Job::Open(_) | Job::Init(_) | Job::Clone(_, _, _, _)) {
                 self.history_limit = 300;
@@ -892,6 +936,19 @@ impl GitVibe {
                     };
                     finish_index_job(repo, history_limit, label, |path| git::run_owned(path, &args))
                 }
+                Job::Run(args) if args.first().is_some_and(|arg| arg == "commit") => match repo {
+                    Some(p) => {
+                        let operation = git::with_commit_history(&p, || git::run_owned(&p, &args));
+                        match git::snapshot_with_limit(&p, history_limit) {
+                            Ok(snapshot) => match operation {
+                                Ok((output, change)) => Done::CommitChanged(output, snapshot, change),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
                 Job::Run(args) => match repo {
                     Some(p) => {
                         let operation = git::run_owned(&p, &args);
@@ -910,12 +967,25 @@ impl GitVibe {
                     }
                     None => Done::Ran(Err("No repository selected".to_owned())),
                 },
-                Job::UndoIndex(change, redo) => match repo {
+                Job::Undo(UndoAction::Index(change), redo) => match repo {
                     Some(path) => {
                         let operation = git::replay_index_change(&path, &change, redo);
                         match git::snapshot_with_limit(&path, history_limit) {
                             Ok(snapshot) => match operation {
                                 Ok(output) => Done::IndexMoved(output, snapshot, change, redo),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
+                Job::Undo(UndoAction::Commit(change), redo) => match repo {
+                    Some(path) => {
+                        let operation = git::replay_commit_change(&path, &change, redo);
+                        match git::snapshot_with_limit(&path, history_limit) {
+                            Ok(snapshot) => match operation {
+                                Ok(output) => Done::CommitMoved(output, snapshot, change, redo),
                                 Err(error) => Done::RanFailed(error, snapshot),
                             },
                             Err(error) => Done::Ran(Err(error)),
@@ -1081,21 +1151,31 @@ impl GitVibe {
         let Some(receiver) = &self.receiver else {
             return;
         };
-        let Ok(done) = receiver.try_recv() else {
-            return;
+        let done = match receiver.try_recv() {
+            Ok(done) => done,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.receiver = None;
+                self.busy = false;
+                self.error =
+                    "A background operation stopped unexpectedly. Open the diagnostic log for details."
+                        .into();
+                return;
+            }
         };
         self.receiver = None;
         self.busy = false;
-        let mut keep_index_history = false;
+        let mut keep_undo_history = false;
+        let mut focus_commit = None;
         let done = match done {
             Done::IndexChanged(output, snapshot, change) => {
                 if let Some(change) = change {
-                    self.undo_stack.push(change);
+                    self.undo_stack.push(UndoAction::Index(change));
                     if self.undo_stack.len() > 20 {
                         self.undo_stack.remove(0);
                     }
                     self.redo_stack.clear();
-                    keep_index_history = true;
+                    keep_undo_history = true;
                 } else {
                     self.undo_stack.clear();
                     self.redo_stack.clear();
@@ -1105,12 +1185,51 @@ impl GitVibe {
             Done::IndexMoved(output, snapshot, change, redo) => {
                 if redo {
                     self.redo_stack.pop();
-                    self.undo_stack.push(change);
+                    self.undo_stack.push(UndoAction::Index(change));
                 } else {
                     self.undo_stack.pop();
-                    self.redo_stack.push(change);
+                    self.redo_stack.push(UndoAction::Index(change));
                 }
-                keep_index_history = true;
+                keep_undo_history = true;
+                Done::Ran(Ok((output, snapshot)))
+            }
+            Done::CommitChanged(output, snapshot, change) => {
+                if let Some(change) = change {
+                    if self.page == Page::History
+                        && self.selected_commit.as_deref() == Some(&change.before)
+                    {
+                        focus_commit = Some(change.after.clone());
+                    }
+                    self.undo_stack.push(UndoAction::Commit(change));
+                    if self.undo_stack.len() > 20 {
+                        self.undo_stack.remove(0);
+                    }
+                    self.redo_stack.clear();
+                    keep_undo_history = true;
+                } else {
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
+                }
+                Done::Ran(Ok((output, snapshot)))
+            }
+            Done::CommitMoved(output, snapshot, change, redo) => {
+                if self.selected_commit.as_deref()
+                    == Some(if redo { &change.before } else { &change.after })
+                {
+                    focus_commit = Some(if redo {
+                        change.after.clone()
+                    } else {
+                        change.before.clone()
+                    });
+                }
+                if redo {
+                    self.redo_stack.pop();
+                    self.undo_stack.push(UndoAction::Commit(change));
+                } else {
+                    self.undo_stack.pop();
+                    self.redo_stack.push(UndoAction::Commit(change));
+                }
+                keep_undo_history = true;
                 Done::Ran(Ok((output, snapshot)))
             }
             other => other,
@@ -1181,7 +1300,7 @@ impl GitVibe {
                     }
                     self.merge_check = None;
                     self.merge_check_error.clear();
-                    if !keep_index_history {
+                    if !keep_undo_history {
                         self.undo_stack.clear();
                         self.redo_stack.clear();
                     }
@@ -1211,7 +1330,7 @@ impl GitVibe {
                     self.repo = Some(snapshot.root.clone());
                     self.snapshot = Some(snapshot);
                     self.interactive_plan = None;
-                    if let Some(id) = new_head {
+                    if let Some(id) = new_head.or(focus_commit) {
                         self.select_commit(&id);
                     }
                     self.error.clear();
@@ -1411,7 +1530,145 @@ impl GitVibe {
                     }
                 }
             }
-            Done::IndexChanged(..) | Done::IndexMoved(..) => unreachable!(),
+            Done::IndexChanged(..)
+            | Done::IndexMoved(..)
+            | Done::CommitChanged(..)
+            | Done::CommitMoved(..) => unreachable!(),
+        }
+    }
+
+    fn poll_watch(&mut self) {
+        let Some(receiver) = &self.watch_receiver else {
+            return;
+        };
+        let watched = match receiver.try_recv() {
+            Ok(watched) => watched,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.watch_receiver = None;
+                return;
+            }
+        };
+        self.watch_receiver = None;
+        if self.busy
+            || self.pending.is_some()
+            || self.watch_generation != watched.generation
+            || self.repo.as_ref() != Some(&watched.repo)
+        {
+            return;
+        }
+        let Ok((snapshot, changed_diff)) = watched.result else {
+            return;
+        };
+        let branch_changed = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|old| old.branch != snapshot.branch);
+        if branch_changed {
+            self.merge_check = None;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+        }
+        if let Some(path) = self.selected_file.clone() {
+            let staged = self.selected_file_staged;
+            if !snapshot.status.iter().any(|file| {
+                file.path == path
+                    && if staged {
+                        file.staged()
+                    } else {
+                        file.unstaged()
+                    }
+            }) {
+                self.selected_file = None;
+                self.detail.clear();
+                self.syntax_cache.clear();
+            } else if let Some((diff_path, diff_staged, detail, colors)) = changed_diff
+                && self.page == Page::Changes
+                && diff_path == path
+                && diff_staged == staged
+                && self.detail.starts_with("diff --git ")
+            {
+                self.detail = detail;
+                self.syntax_cache = colors
+                    .into_iter()
+                    .map(|(key, color)| (key, Arc::new(color)))
+                    .collect();
+            }
+        }
+        self.snapshot = Some(snapshot);
+    }
+
+    fn schedule_watch(&mut self, ctx: &egui::Context) {
+        const INTERVAL: Duration = Duration::from_secs(2);
+        let Some(repo) = self.repo.clone() else {
+            return;
+        };
+        let elapsed = self.watch_started.elapsed();
+        if elapsed < INTERVAL {
+            ctx.request_repaint_after(INTERVAL - elapsed);
+            return;
+        }
+        if self.busy || self.pending.is_some() || self.watch_receiver.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(300));
+            return;
+        }
+        self.watch_started = Instant::now();
+        let generation = self.watch_generation;
+        let history_limit = self.history_limit;
+        let selected = if self.page == Page::Changes && self.detail.starts_with("diff --git ") {
+            self.selected_file
+                .clone()
+                .map(|path| (path, self.selected_file_staged, self.detail.clone()))
+        } else {
+            None
+        };
+        let (sender, receiver) = mpsc::channel();
+        self.watch_receiver = Some(receiver);
+        let repaint_ctx = ctx.clone();
+        thread::spawn(move || {
+            let result = git::snapshot_with_limit(&repo, history_limit).map(|snapshot| {
+                let changed_diff = selected.and_then(|(path, staged, old_detail)| {
+                    let mut args = vec!["diff".into(), "--no-ext-diff".into(), "--no-color".into()];
+                    if staged {
+                        args.push("--cached".into());
+                    }
+                    args.extend(["--".into(), path.clone()]);
+                    let detail = git::run_owned(&repo, &args).ok()?;
+                    if detail == old_detail {
+                        return None;
+                    }
+                    let colors = syntax::highlight_diff(&repo, &args, &detail);
+                    Some((path, staged, detail, colors))
+                });
+                (snapshot, changed_diff)
+            });
+            let _ = sender.send(Watched {
+                repo,
+                generation,
+                result,
+            });
+            repaint_ctx.request_repaint();
+        });
+        ctx.request_repaint_after(INTERVAL);
+    }
+
+    fn log_errors(&mut self) {
+        let update_error = match &self.update_state {
+            UpdateState::Failed(error) => error.clone(),
+            _ => String::new(),
+        };
+        for (source, message) in [
+            ("git", self.error.clone()),
+            ("merge target", self.merge_check_error.clone()),
+            ("Git LFS", self.lfs_error.clone()),
+            ("update", update_error),
+        ] {
+            if message.is_empty() {
+                self.last_logged_errors.remove(source);
+            } else if self.last_logged_errors.get(source) != Some(&message) {
+                logging::error(source, &message);
+                self.last_logged_errors.insert(source, message);
+            }
         }
     }
 
@@ -1673,24 +1930,20 @@ impl GitVibe {
                     let undo = ui
                         .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo"))
                         .on_hover_text(format!(
-                            "Undo staging change only: {}",
-                            self.undo_stack
-                                .last()
-                                .map_or("none", |change| change.label.as_str())
+                            "Undo: {}",
+                            self.undo_stack.last().map_or("none", UndoAction::label)
                         ));
                     if undo.clicked() {
-                        self.undo_index(false);
+                        self.undo_last(false);
                     }
                     let redo = ui
                         .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo"))
                         .on_hover_text(format!(
-                            "Redo staging change only: {}",
-                            self.redo_stack
-                                .last()
-                                .map_or("none", |change| change.label.as_str())
+                            "Redo: {}",
+                            self.redo_stack.last().map_or("none", UndoAction::label)
                         ));
                     if redo.clicked() {
-                        self.undo_index(true);
+                        self.undo_last(true);
                     }
                     if toolbar_action(ui, "Fetch") {
                         self.git(&["fetch", "--all", "--prune"]);
@@ -1768,14 +2021,14 @@ impl GitVibe {
         }
     }
 
-    fn undo_index(&mut self, redo: bool) {
+    fn undo_last(&mut self, redo: bool) {
         let change = if redo {
             self.redo_stack.last()
         } else {
             self.undo_stack.last()
         };
         if let Some(change) = change.cloned() {
-            self.queue(Job::UndoIndex(change, redo));
+            self.queue(Job::Undo(change, redo));
         }
     }
 
@@ -1845,8 +2098,8 @@ impl GitVibe {
                     self.git(&["restore", "--staged", "."]);
                 }
             }
-            PaletteAction::UndoIndex => self.undo_index(false),
-            PaletteAction::RedoIndex => self.undo_index(true),
+            PaletteAction::UndoLast => self.undo_last(false),
+            PaletteAction::RedoLast => self.undo_last(true),
         }
     }
 
@@ -1897,8 +2150,8 @@ impl GitVibe {
                                         snapshot.status.iter().any(git::FileStatus::staged)
                                     })
                                 }
-                                PaletteAction::UndoIndex => !self.undo_stack.is_empty(),
-                                PaletteAction::RedoIndex => !self.redo_stack.is_empty(),
+                                PaletteAction::UndoLast => !self.undo_stack.is_empty(),
+                                PaletteAction::RedoLast => !self.redo_stack.is_empty(),
                                 _ => true,
                             }
                             && label.to_lowercase().contains(&query)
@@ -4794,6 +5047,28 @@ impl GitVibe {
                     }
                 }
             });
+        ui.add_space(18.0);
+        egui::Frame::new()
+            .fill(panel())
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(Stroke::new(1.0, border()))
+            .inner_margin(egui::Margin::same(18))
+            .show(ui, |ui| {
+                ui.label(RichText::new("DIAGNOSTICS").size(10.0).strong().color(muted()));
+                ui.add_space(6.0);
+                ui.label("GitVibe records app errors and crashes here. Logs rotate at 2 MB and do not include command arguments.");
+                ui.label(RichText::new(logging::path().display().to_string()).monospace().color(muted()));
+                ui.horizontal(|ui| {
+                    if action(ui, "Open log folder", false)
+                        && let Err(error) = logging::open_folder()
+                    {
+                        self.error = error;
+                    }
+                    if action(ui, "Copy log path", false) {
+                        ui.ctx().copy_text(logging::path().display().to_string());
+                    }
+                });
+            });
     }
 
     fn change_diff_view(&mut self, ui: &mut egui::Ui) {
@@ -6547,6 +6822,7 @@ impl eframe::App for GitVibe {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.poll_watch();
         self.poll_updates();
         if !self.palette_open
             && ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F))
@@ -6558,12 +6834,17 @@ impl eframe::App for GitVibe {
             self.open_palette();
         }
         if !self.palette_open && !self.busy && !ctx.text_edit_focused() {
-            let index_shortcut = ctx.input(|input| {
-                (input.modifiers.command && input.key_pressed(egui::Key::Z))
-                    .then_some(input.modifiers.shift)
+            let undo_shortcut = ctx.input(|input| {
+                if input.modifiers.command && input.key_pressed(egui::Key::Y) {
+                    Some(true)
+                } else if input.modifiers.command && input.key_pressed(egui::Key::Z) {
+                    Some(input.modifiers.shift)
+                } else {
+                    None
+                }
             });
-            if let Some(redo) = index_shortcut {
-                self.undo_index(redo);
+            if let Some(redo) = undo_shortcut {
+                self.undo_last(redo);
             }
         }
         if self.page == Page::Changes
@@ -6861,6 +7142,8 @@ impl eframe::App for GitVibe {
             self.queue(Job::LoadCommitTemplate);
         }
         self.launch(&ctx);
+        self.schedule_watch(&ctx);
+        self.log_errors();
     }
 }
 
@@ -6930,6 +7213,9 @@ fn diff_line(ui: &mut egui::Ui, line: &str) {
 
 fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow, colors: &syntax::HunkColors) {
     ui.columns(2, |columns| {
+        for column in columns.iter_mut() {
+            column.set_clip_rect(column.clip_rect().intersect(column.max_rect()));
+        }
         if let Some(old) = &row.old {
             let counterpart = if old.line.starts_with('-') {
                 row.new.as_ref().map(|side| side.line.as_str())
@@ -6943,7 +7229,7 @@ fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow, colors: &syntax::H
                 None,
                 counterpart,
                 colors.old_line(Some(old.number)),
-                false,
+                true,
             );
         } else {
             columns[0].add_space(18.0);
@@ -6961,7 +7247,7 @@ fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow, colors: &syntax::H
                 Some(new.number),
                 counterpart,
                 colors.new_line(Some(new.number)),
-                false,
+                true,
             );
         } else {
             columns[1].add_space(18.0);
