@@ -31,12 +31,17 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 2. Worktrees in the branch rail, with change counts and their own WIP rows. Branch context menus can start a worktree.
 3. Edit remote URLs in the Branches & tags view.
 
+## Completed in 0.10.0
+
+1. Searchable command palette for repository navigation and common actions.
+2. Repository tab cycling, graph arrow navigation, and selected-file stage and unstage shortcuts.
+
 ## Next: GitKraken workflow parity
 
 1. **Diff review.** Improve syntax coloring with language-aware parsing. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
 2. **Undo and redo.** Track reversible local Git actions with explicit recovery data. GitKraken limits undo to supported recent actions; GitVibe should make the same scope visible before offering a button. See its [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
-3. **Keyboard workflow.** Add a command palette, tab switching, graph navigation, stage/unstage shortcuts, and an accessibility pass for focus order, labels, contrast, and screen-reader semantics. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison.
-4. **Repository operations.** Add a searchable repository command menu. Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
+3. **Accessibility.** Review focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
+4. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
 
 ## Needs account or distribution decisions
 
