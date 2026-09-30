@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     git::{self, Snapshot},
-    updates,
+    github, updates,
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 
@@ -160,6 +160,10 @@ enum Page {
     Changelog,
     Branches,
     Stashes,
+    Worktrees,
+    Submodules,
+    Rebase,
+    PullRequests,
     Console,
     Updates,
 }
@@ -230,6 +234,14 @@ enum Job {
     Run(Vec<String>),
     SwitchBranch(String, bool, bool),
     Shell(String, PathBuf),
+    LoadPullRequests,
+    CreatePullRequest {
+        head: String,
+        base: String,
+        title: String,
+        body: String,
+    },
+    ExportPatch(Vec<String>, PathBuf),
     Inspect(Vec<String>),
     InspectCommit(String),
     InspectFile(String),
@@ -248,7 +260,11 @@ enum Job {
 enum Done {
     Loaded(Result<Snapshot, String>),
     Ran(Result<(String, Snapshot), String>),
+    RanFailed(String, Snapshot),
     Shell(Result<String, String>),
+    PullRequests(Result<Vec<github::PullRequest>, String>),
+    PullRequestCreated(Result<String, String>),
+    Exported(Result<String, String>),
     Inspected(Result<String, String>),
     CommitInspected(String, Result<(String, Vec<git::CommitFile>), String>),
     Searched(Result<(Vec<git::Commit>, bool), String>),
@@ -276,8 +292,24 @@ pub struct GitVibe {
     clone_source: usize,
     clone_shallow: bool,
     clone_sparse: bool,
+    worktree_path: String,
+    worktree_branch: String,
+    worktree_ref: String,
+    submodule_url: String,
+    submodule_path: String,
+    rebase_onto: String,
+    rebase_autostash: bool,
+    pr_base: String,
+    pr_title: String,
+    pr_body: String,
+    pull_requests: Vec<github::PullRequest>,
+    pr_loaded_for: Option<PathBuf>,
     branch_input: String,
     tag_input: String,
+    tag_message: String,
+    annotated_tag: bool,
+    remote_name: String,
+    remote_url: String,
     commit_message: String,
     command_input: String,
     terminal_output: String,
@@ -297,6 +329,7 @@ pub struct GitVibe {
     selected_file_staged: bool,
     detail: String,
     output: String,
+    notice: String,
     error: String,
     search: String,
     search_results: Vec<git::Commit>,
@@ -314,9 +347,12 @@ pub struct GitVibe {
     confirm_checkout_commit: Option<String>,
     create_ref_at: Option<(RefAtKind, String)>,
     confirm_delete_ref: Option<RefDeletion>,
+    confirm_remove_remote: Option<String>,
     confirm_reset: Option<String>,
     confirm_conflict_side: Option<(String, git::ConflictSide)>,
     confirm_abort_merge: bool,
+    confirm_remove_worktree: Option<PathBuf>,
+    confirm_rebase: Option<Vec<String>>,
     reset_mode: ResetMode,
     reset_confirmation: String,
     committing: bool,
@@ -462,8 +498,24 @@ impl GitVibe {
             clone_source: 0,
             clone_shallow: false,
             clone_sparse: false,
+            worktree_path: String::new(),
+            worktree_branch: String::new(),
+            worktree_ref: "HEAD".to_owned(),
+            submodule_url: String::new(),
+            submodule_path: String::new(),
+            rebase_onto: String::new(),
+            rebase_autostash: false,
+            pr_base: "main".to_owned(),
+            pr_title: String::new(),
+            pr_body: String::new(),
+            pull_requests: Vec::new(),
+            pr_loaded_for: None,
             branch_input: String::new(),
             tag_input: String::new(),
+            tag_message: String::new(),
+            annotated_tag: false,
+            remote_name: String::new(),
+            remote_url: String::new(),
             commit_message: String::new(),
             command_input: String::new(),
             terminal_output: String::new(),
@@ -483,6 +535,7 @@ impl GitVibe {
             selected_file_staged: false,
             detail: String::new(),
             output: String::new(),
+            notice: String::new(),
             error: String::new(),
             search: String::new(),
             search_results: Vec::new(),
@@ -500,9 +553,12 @@ impl GitVibe {
             confirm_checkout_commit: None,
             create_ref_at: None,
             confirm_delete_ref: None,
+            confirm_remove_remote: None,
             confirm_reset: None,
             confirm_conflict_side: None,
             confirm_abort_merge: false,
+            confirm_remove_worktree: None,
+            confirm_rebase: None,
             reset_mode: ResetMode::Mixed,
             reset_confirmation: String::new(),
             committing: false,
@@ -567,6 +623,7 @@ impl GitVibe {
 
     fn queue(&mut self, job: Job) {
         if !self.busy {
+            self.notice.clear();
             if matches!(&job, Job::Open(_) | Job::Init(_) | Job::Clone(_, _, _, _)) {
                 self.history_limit = 300;
             }
@@ -600,18 +657,35 @@ impl GitVibe {
                     git::clone_repo_with_options(&url, &path, shallow, sparse)
                         .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
+                Job::LoadPullRequests => Done::PullRequests(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|path| github::list(&path)),
+                ),
+                Job::CreatePullRequest { head, base, title, body } => Done::PullRequestCreated(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|path| github::create(&path, &head, &base, &title, &body)),
+                ),
+                Job::ExportPatch(args, path) => Done::Exported(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|repo| git::export_patch(&repo, &args, &path)),
+                ),
                 Job::Refresh => Done::Loaded(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
-                Job::Run(args) => Done::Ran(
-                    repo.ok_or("No repository selected".to_owned())
-                        .and_then(|p| {
-                            let output = git::run_owned(&p, &args)?;
-                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
-                            Ok((output, snapshot))
-                        }),
-                ),
+                Job::Run(args) => match repo {
+                    Some(p) => {
+                        let operation = git::run_owned(&p, &args);
+                        match git::snapshot_with_limit(&p, history_limit) {
+                            Ok(snapshot) => match operation {
+                                Ok(output) => Done::Ran(Ok((output, snapshot))),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
                 Job::SwitchBranch(name, stash_first, remote) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
                         let mut output = String::new();
@@ -765,6 +839,8 @@ impl GitVibe {
                         self.conflict_editor = None;
                         self.commit_files.clear();
                         self.commit_files_id = None;
+                        self.pr_loaded_for = None;
+                        self.pull_requests.clear();
                     }
                     self.repo = Some(snapshot.root.clone());
                     if self.terminal_cwd.is_none() {
@@ -812,6 +888,9 @@ impl GitVibe {
                         None
                     };
                     self.output = output;
+                    if !self.output.is_empty() && self.output.len() < 140 {
+                        self.notice = self.output.clone();
+                    }
                     self.repo = Some(snapshot.root.clone());
                     self.snapshot = Some(snapshot);
                     if let Some(id) = new_head {
@@ -867,6 +946,14 @@ impl GitVibe {
                     self.conflict_action = false;
                 }
             },
+            Done::RanFailed(error, snapshot) => {
+                self.repo = Some(snapshot.root.clone());
+                self.snapshot = Some(snapshot);
+                self.error = error;
+                self.committing = false;
+                self.hunk_action = false;
+                self.conflict_action = false;
+            }
             Done::Inspected(result) => match result {
                 Ok(text) => {
                     self.detail = text;
@@ -886,6 +973,32 @@ impl GitVibe {
                     self.terminal_output.push_str(&format!("{error}\n"));
                     self.error = error;
                 }
+            },
+            Done::PullRequests(result) => match result {
+                Ok(requests) => {
+                    self.pull_requests = requests;
+                    self.error.clear();
+                }
+                Err(error) => self.error = error,
+            },
+            Done::PullRequestCreated(result) => match result {
+                Ok(url) => {
+                    self.output = format!("Created pull request: {url}");
+                    self.pr_title.clear();
+                    self.pr_body.clear();
+                    self.error.clear();
+                    self.queue(Job::LoadPullRequests);
+                    self.notice = format!("Created pull request: {url}");
+                }
+                Err(error) => self.error = error,
+            },
+            Done::Exported(result) => match result {
+                Ok(message) => {
+                    self.output = message;
+                    self.notice = self.output.clone();
+                    self.error.clear();
+                }
+                Err(error) => self.error = error,
             },
             Done::CommitInspected(id, result) => match result {
                 Ok((detail, files)) => {
@@ -1500,6 +1613,10 @@ impl GitVibe {
         for (page, title) in [
             (Page::Branches, "Branches & tags"),
             (Page::Stashes, "Stashes"),
+            (Page::Worktrees, "Worktrees"),
+            (Page::Submodules, "Submodules"),
+            (Page::Rebase, "Rebase"),
+            (Page::PullRequests, "Pull requests"),
             (Page::Console, "Terminal"),
             (Page::Updates, "Updates"),
         ] {
@@ -1542,16 +1659,21 @@ impl GitVibe {
                 {
                     self.queue(Job::SearchHistory(self.search.clone()));
                 }
-                if ui
-                    .add_sized(
-                        [250.0, 25.0],
-                        egui::TextEdit::singleline(&mut self.search)
-                            .hint_text("Search commits, authors or SHA")
-                            .desired_width(250.0),
-                    )
-                    .changed()
-                {
+                let search_edit = ui.add_sized(
+                    [250.0, 25.0],
+                    egui::TextEdit::singleline(&mut self.search)
+                        .id(egui::Id::new("history_search"))
+                        .hint_text("Search commits, authors or SHA")
+                        .desired_width(250.0),
+                );
+                if search_edit.changed() {
                     self.search_active = false;
+                }
+                if search_edit.has_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    && !self.search.trim().is_empty()
+                {
+                    self.queue(Job::SearchHistory(self.search.clone()));
                 }
             });
         });
@@ -1820,6 +1942,24 @@ impl GitVibe {
             self.queue(Job::Inspect(vec!["diff".into(), id.clone()]));
             ui.close();
         }
+        if commit.parents.len() < 2 && ui.button("Export commit patch...").clicked() {
+            if let Some(destination) = rfd::FileDialog::new()
+                .set_file_name(format!("{}.patch", commit.short))
+                .save_file()
+            {
+                self.queue(Job::ExportPatch(
+                    vec![
+                        "format-patch".into(),
+                        "-1".into(),
+                        "--stdout".into(),
+                        "--binary".into(),
+                        id.clone(),
+                    ],
+                    destination,
+                ));
+            }
+            ui.close();
+        }
         ui.separator();
         if ui.button("Checkout this commit...").clicked() {
             self.confirm_checkout_commit = Some(id.clone());
@@ -1828,6 +1968,13 @@ impl GitVibe {
         if ui.button("Create branch here...").clicked() {
             self.branch_input.clear();
             self.inline_branch_at = Some(id.clone());
+            ui.close();
+        }
+        if ui.button("Create worktree from this commit...").clicked() {
+            self.worktree_ref = id.clone();
+            self.worktree_path.clear();
+            self.worktree_branch.clear();
+            self.page = Page::Worktrees;
             ui.close();
         }
         if ui.button("Create tag here...").clicked() {
@@ -2002,6 +2149,21 @@ impl GitVibe {
                 .strong()
                 .color(text()),
             );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Apply patch..."))
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Git patch", &["patch", "diff"])
+                        .pick_file()
+                {
+                    self.git_owned(vec![
+                        "apply".into(),
+                        "--".into(),
+                        path.to_string_lossy().into_owned(),
+                    ]);
+                }
+            });
         });
         ui.separator();
         let unstaged: Vec<_> = snapshot
@@ -2300,6 +2462,7 @@ impl GitVibe {
         let branches = snapshot.branches.clone();
         let local_names = branches.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
         let remote_branches = snapshot.remote_branches.clone();
+        let remotes = snapshot.remotes.clone();
         let tags = snapshot.tags.clone();
         egui::Frame::new()
             .fill(panel_alt())
@@ -2419,12 +2582,40 @@ impl GitVibe {
                             .hint_text("New tag name")
                             .desired_width(200.0),
                     );
-                    if action(ui, "Create tag", false) && !self.tag_input.trim().is_empty() {
+                    if ui
+                        .add_enabled(
+                            !self.busy
+                                && !self.tag_input.trim().is_empty()
+                                && (!self.annotated_tag || !self.tag_message.trim().is_empty()),
+                            egui::Button::new("Create tag"),
+                        )
+                        .clicked()
+                    {
                         let name = self.tag_input.trim().to_owned();
-                        self.git_owned(vec!["tag".into(), name]);
+                        let args = if self.annotated_tag {
+                            vec![
+                                "tag".into(),
+                                "-a".into(),
+                                name,
+                                "-m".into(),
+                                self.tag_message.trim().to_owned(),
+                            ]
+                        } else {
+                            vec!["tag".into(), name]
+                        };
+                        self.git_owned(args);
                         self.tag_input.clear();
+                        self.tag_message.clear();
                     }
                 });
+                ui.checkbox(&mut self.annotated_tag, "Annotated tag");
+                if self.annotated_tag {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.tag_message)
+                            .hint_text("Tag message")
+                            .desired_width(300.0),
+                    );
+                }
                 for tag in tags {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -2469,7 +2660,590 @@ impl GitVibe {
                         }
                     });
                 }
+                ui.add_space(15.0);
+                ui.separator();
+                ui.label(
+                    RichText::new(format!("REMOTES  |  {}", remotes.len()))
+                        .size(11.0)
+                        .strong()
+                        .color(muted()),
+                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.remote_name)
+                            .hint_text("Name")
+                            .desired_width(110.0),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.remote_url)
+                            .hint_text("Repository URL")
+                            .desired_width(300.0),
+                    );
+                    if ui
+                        .add_enabled(
+                            !self.busy
+                                && !self.remote_name.trim().is_empty()
+                                && !self.remote_url.trim().is_empty(),
+                            egui::Button::new("Add remote"),
+                        )
+                        .clicked()
+                    {
+                        self.git_owned(vec![
+                            "remote".into(),
+                            "add".into(),
+                            self.remote_name.trim().to_owned(),
+                            self.remote_url.trim().to_owned(),
+                        ]);
+                        self.remote_name.clear();
+                        self.remote_url.clear();
+                    }
+                });
+                for remote in remotes {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&remote).color(text()));
+                        if ui
+                            .add_enabled(!self.busy, egui::Button::new("Remove..."))
+                            .clicked()
+                        {
+                            self.confirm_remove_remote = Some(remote);
+                        }
+                    });
+                }
             });
+    }
+
+    fn worktree_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "PARALLEL CHECKOUTS",
+            "Worktrees",
+            "Keep another branch in its own folder.",
+        );
+        ui.add_space(14.0);
+        let Some(snapshot) = &self.snapshot else {
+            self.empty(ui);
+            return;
+        };
+        let current_root = snapshot.root.clone();
+        let worktrees = snapshot.worktrees.clone();
+        egui::Frame::new()
+            .fill(panel_alt())
+            .stroke(Stroke::new(1.0, border()))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("ADD WORKTREE")
+                        .small()
+                        .strong()
+                        .color(accent()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Folder");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.worktree_path).desired_width(380.0),
+                    );
+                    if action(ui, "Browse parent", false)
+                        && let Some(parent) = pick_folder(current_root.parent())
+                    {
+                        let name = self
+                            .worktree_branch
+                            .rsplit('/')
+                            .next()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("worktree");
+                        self.worktree_path = parent.join(name).to_string_lossy().into_owned();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("New branch (optional)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.worktree_branch).desired_width(280.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Starting commit or branch");
+                    ui.add(egui::TextEdit::singleline(&mut self.worktree_ref).desired_width(280.0));
+                });
+                ui.label(
+                    RichText::new(
+                        "Leave branch blank for a detached checkout at the chosen revision.",
+                    )
+                    .small()
+                    .color(muted()),
+                );
+                let enabled = !self.busy
+                    && !self.worktree_path.trim().is_empty()
+                    && !self.worktree_ref.trim().is_empty();
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Add worktree"))
+                    .clicked()
+                {
+                    let mut args = vec!["worktree".into(), "add".into()];
+                    if self.worktree_branch.trim().is_empty() {
+                        args.push("--detach".into());
+                    } else {
+                        args.extend(["-b".into(), self.worktree_branch.trim().to_owned()]);
+                    }
+                    args.push(self.worktree_path.trim().to_owned());
+                    args.push(self.worktree_ref.trim().to_owned());
+                    self.git_owned(args);
+                }
+            });
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new(format!("WORKTREES  |  {}", worktrees.len()))
+                .small()
+                .strong()
+                .color(muted()),
+        );
+        ui.add_space(5.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for worktree in worktrees {
+                let is_current = worktree.path == current_root;
+                egui::Frame::new()
+                    .fill(panel())
+                    .stroke(Stroke::new(1.0, border()))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(worktree.path.display().to_string()).strong(),
+                                );
+                                let branch = worktree.branch.as_deref().unwrap_or("Detached HEAD");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  ·  {}",
+                                        branch,
+                                        &worktree.head[..worktree.head.len().min(8)]
+                                    ))
+                                    .small()
+                                    .color(muted()),
+                                );
+                                if worktree.prunable {
+                                    ui.label(
+                                        RichText::new("Missing folder; metadata can be pruned")
+                                            .small()
+                                            .color(orange()),
+                                    );
+                                }
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_enabled_ui(!self.busy, |ui| {
+                                        if !is_current
+                                            && !worktree.prunable
+                                            && action(ui, "Open", true)
+                                        {
+                                            self.queue(Job::Open(worktree.path.clone()));
+                                        }
+                                        if !is_current
+                                            && !worktree.prunable
+                                            && action(ui, "Remove...", false)
+                                        {
+                                            self.confirm_remove_worktree =
+                                                Some(worktree.path.clone());
+                                        }
+                                        if !is_current
+                                            && !worktree.prunable
+                                            && action(
+                                                ui,
+                                                if worktree.locked { "Unlock" } else { "Lock" },
+                                                false,
+                                            )
+                                        {
+                                            self.git_owned(vec![
+                                                "worktree".into(),
+                                                if worktree.locked { "unlock" } else { "lock" }
+                                                    .into(),
+                                                worktree.path.to_string_lossy().into_owned(),
+                                            ]);
+                                        }
+                                    });
+                                    if is_current {
+                                        badge(ui, "CURRENT", accent());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(5.0);
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Prune missing worktrees"))
+                .clicked()
+            {
+                self.git(&["worktree", "prune"]);
+            }
+        });
+    }
+
+    fn submodule_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "NESTED REPOSITORIES",
+            "Submodules",
+            "Initialize and update repositories tracked inside this project.",
+        );
+        ui.add_space(14.0);
+        let Some(snapshot) = &self.snapshot else {
+            self.empty(ui);
+            return;
+        };
+        let submodules = snapshot.submodules.clone();
+        let root = snapshot.root.clone();
+        egui::Frame::new()
+            .fill(panel_alt())
+            .stroke(Stroke::new(1.0, border()))
+            .inner_margin(egui::Margin::same(12))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("ADD SUBMODULE")
+                        .small()
+                        .strong()
+                        .color(accent()),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.submodule_url).desired_width(420.0),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Path");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.submodule_path).desired_width(280.0),
+                    );
+                });
+                if ui
+                    .add_enabled(
+                        !self.busy
+                            && !self.submodule_url.trim().is_empty()
+                            && !self.submodule_path.trim().is_empty(),
+                        egui::Button::new("Add submodule"),
+                    )
+                    .clicked()
+                {
+                    self.git_owned(vec![
+                        "submodule".into(),
+                        "add".into(),
+                        "--".into(),
+                        self.submodule_url.trim().to_owned(),
+                        self.submodule_path.trim().to_owned(),
+                    ]);
+                }
+            });
+        ui.add_space(15.0);
+        ui.add_enabled_ui(!self.busy, |ui| {
+            ui.horizontal(|ui| {
+                if action(ui, "Initialize / update all", true) {
+                    self.git(&["submodule", "update", "--init", "--recursive"]);
+                }
+                if action(ui, "Sync URLs", false) {
+                    self.git(&["submodule", "sync", "--recursive"]);
+                }
+            });
+        });
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(format!("SUBMODULES  |  {}", submodules.len()))
+                .small()
+                .strong()
+                .color(muted()),
+        );
+        ui.add_space(5.0);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for submodule in submodules {
+                egui::Frame::new()
+                    .fill(panel())
+                    .stroke(Stroke::new(1.0, border()))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}  ·  {}",
+                                        submodule.path, submodule.name
+                                    ))
+                                    .strong(),
+                                );
+                                ui.label(RichText::new(&submodule.url).small().color(muted()));
+                                ui.label(
+                                    RichText::new(if submodule.initialized {
+                                        "Initialized"
+                                    } else {
+                                        "Not initialized"
+                                    })
+                                    .small()
+                                    .color(
+                                        if submodule.initialized {
+                                            accent()
+                                        } else {
+                                            orange()
+                                        },
+                                    ),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_enabled_ui(!self.busy, |ui| {
+                                        if submodule.initialized && action(ui, "Open", true) {
+                                            self.queue(Job::Open(root.join(&submodule.path)));
+                                        }
+                                        if action(ui, "Update", false) {
+                                            self.git_owned(vec![
+                                                "submodule".into(),
+                                                "update".into(),
+                                                "--init".into(),
+                                                "--".into(),
+                                                submodule.path.clone(),
+                                            ]);
+                                        }
+                                    });
+                                },
+                            );
+                        });
+                    });
+                ui.add_space(5.0);
+            }
+        });
+    }
+
+    fn pull_request_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "COLLABORATE ON GITHUB",
+            "Pull requests",
+            "Review and open pull requests using your GitHub CLI login.",
+        );
+        ui.add_space(14.0);
+        let Some(snapshot) = &self.snapshot else {
+            self.empty(ui);
+            return;
+        };
+        let root = snapshot.root.clone();
+        let branch = snapshot.branch.clone();
+        let bases = snapshot
+            .branches
+            .iter()
+            .filter(|reference| reference.name != branch)
+            .map(|reference| reference.name.clone())
+            .collect::<Vec<_>>();
+        if self.pr_loaded_for.as_ref() != Some(&root) && !self.busy {
+            self.pr_loaded_for = Some(root);
+            self.queue(Job::LoadPullRequests);
+        }
+        egui::Frame::new().fill(panel_alt()).stroke(Stroke::new(1.0, border())).inner_margin(egui::Margin::same(14)).show(ui, |ui| {
+            ui.label(RichText::new("OPEN A PULL REQUEST").small().strong().color(accent()));
+            ui.add_space(5.0);
+            ui.label(format!("From current branch: {branch}"));
+            ui.horizontal(|ui| {
+                ui.label("Base branch");
+                ui.add(egui::TextEdit::singleline(&mut self.pr_base).desired_width(220.0));
+                egui::ComboBox::from_id_salt("pr_base_picker").selected_text("Choose branch").show_ui(ui, |ui| {
+                    for base in bases {
+                        if ui.selectable_label(false, &base).clicked() { self.pr_base = base; }
+                    }
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.label("Title");
+                ui.add(egui::TextEdit::singleline(&mut self.pr_title).desired_width(430.0));
+            });
+            ui.label("Description");
+            ui.add(egui::TextEdit::multiline(&mut self.pr_body).desired_rows(4).desired_width(520.0));
+            let enabled = !self.busy && !branch.is_empty() && !self.pr_base.trim().is_empty() && !self.pr_title.trim().is_empty();
+            if ui.add_enabled(enabled, egui::Button::new("Create pull request")).clicked() {
+                self.queue(Job::CreatePullRequest {
+                    head: branch,
+                    base: self.pr_base.trim().to_owned(),
+                    title: self.pr_title.trim().to_owned(),
+                    body: self.pr_body.clone(),
+                });
+            }
+            ui.label(RichText::new("Requires the GitHub CLI (`gh`) and an existing login. Push the branch before creating a pull request.").small().color(muted()));
+        });
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "RECENT PULL REQUESTS  |  {}",
+                    self.pull_requests.len()
+                ))
+                .small()
+                .strong()
+                .color(muted()),
+            );
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.queue(Job::LoadPullRequests);
+            }
+        });
+        if !self.error.is_empty() {
+            ui.label(RichText::new(&self.error).color(red()));
+        }
+        let requests = self.pull_requests.clone();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for request in requests {
+                egui::Frame::new()
+                    .fill(panel())
+                    .stroke(Stroke::new(1.0, border()))
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            badge(
+                                ui,
+                                &request.state,
+                                if request.state == "OPEN" {
+                                    accent()
+                                } else {
+                                    muted()
+                                },
+                            );
+                            ui.hyperlink_to(
+                                format!("#{}  {}", request.number, request.title),
+                                &request.url,
+                            );
+                        });
+                        ui.label(
+                            RichText::new(format!("{} → {}", request.head, request.base))
+                                .small()
+                                .color(muted()),
+                        );
+                    });
+                ui.add_space(5.0);
+            }
+        });
+    }
+
+    fn rebase_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "REWRITE BRANCH HISTORY",
+            "Rebase",
+            "Replay the current branch onto another branch or commit.",
+        );
+        ui.add_space(14.0);
+        let Some(snapshot) = &self.snapshot else {
+            self.empty(ui);
+            return;
+        };
+        let branch = snapshot.branch.clone();
+        let dirty = !snapshot.status.is_empty();
+        let in_progress = snapshot.rebase_in_progress;
+        let conflicts = snapshot
+            .status
+            .iter()
+            .filter(|file| file.conflicted())
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        let targets = snapshot
+            .branches
+            .iter()
+            .chain(&snapshot.remote_branches)
+            .filter(|reference| reference.name != branch)
+            .map(|reference| reference.name.clone())
+            .collect::<Vec<_>>();
+        if in_progress {
+            egui::Frame::new()
+                .fill(panel_alt())
+                .stroke(Stroke::new(1.0, orange()))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    badge(ui, "REBASE IN PROGRESS", orange());
+                    if !conflicts.is_empty() {
+                        ui.label("Resolve and stage these files before continuing:");
+                        for path in &conflicts {
+                            ui.label(RichText::new(path).color(orange()));
+                        }
+                        if action(ui, "View changes", false) {
+                            self.page = Page::Changes;
+                        }
+                    } else {
+                        ui.label("Continue to apply the next commit, or stop the rebase.");
+                    }
+                    ui.add_enabled_ui(!self.busy, |ui| {
+                        ui.horizontal(|ui| {
+                            if action(ui, "Continue", true) {
+                                self.git(&["-c", "core.editor=true", "rebase", "--continue"]);
+                            }
+                            if action(ui, "Skip commit...", false) {
+                                self.confirm_rebase = Some(vec!["rebase".into(), "--skip".into()]);
+                            }
+                            if action(ui, "Abort...", false) {
+                                self.confirm_rebase = Some(vec!["rebase".into(), "--abort".into()]);
+                            }
+                        });
+                    });
+                });
+            return;
+        }
+        egui::Frame::new()
+            .fill(panel_alt())
+            .stroke(Stroke::new(1.0, border()))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.label(format!("Current branch: {branch}"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Rebase onto");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.rebase_onto)
+                            .hint_text("Branch, tag, or commit SHA")
+                            .desired_width(330.0),
+                    );
+                    egui::ComboBox::from_id_salt("rebase_target_picker")
+                        .selected_text("Choose branch")
+                        .show_ui(ui, |ui| {
+                            for target in targets {
+                                if ui.selectable_label(false, &target).clicked() {
+                                    self.rebase_onto = target;
+                                }
+                            }
+                        });
+                });
+                ui.checkbox(
+                    &mut self.rebase_autostash,
+                    "Temporarily stash and restore local changes",
+                );
+                if dirty && !self.rebase_autostash {
+                    ui.label(
+                        RichText::new(
+                            "The working tree has changes. Enable autostash or commit them first.",
+                        )
+                        .color(orange()),
+                    );
+                }
+                ui.add_space(10.0);
+                let enabled = !self.busy
+                    && !branch.is_empty()
+                    && !self.rebase_onto.trim().is_empty()
+                    && (!dirty || self.rebase_autostash);
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Review rebase..."))
+                    .clicked()
+                {
+                    let mut args = vec!["-c".into(), "core.editor=true".into(), "rebase".into()];
+                    if self.rebase_autostash {
+                        args.push("--autostash".into());
+                    }
+                    args.push(self.rebase_onto.trim().to_owned());
+                    self.confirm_rebase = Some(args);
+                }
+            });
+        ui.add_space(10.0);
+        ui.label(
+            RichText::new(
+                "Rebase changes commit IDs. Git keeps the previous tip in the reflog for recovery.",
+            )
+            .small()
+            .color(muted()),
+        );
     }
 
     fn stashes(&mut self, ui: &mut egui::Ui) {
@@ -2927,6 +3701,25 @@ impl GitVibe {
                     "--".into(),
                     path.clone(),
                 ]));
+            }
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Export patch..."))
+                .clicked()
+                && let Some(destination) = rfd::FileDialog::new()
+                    .set_file_name("changes.patch")
+                    .save_file()
+            {
+                let mut args = vec![
+                    "diff".into(),
+                    "--binary".into(),
+                    "--no-ext-diff".into(),
+                    "--no-color".into(),
+                ];
+                if self.selected_file_staged {
+                    args.push("--cached".into());
+                }
+                args.extend(["--".into(), path.clone()]);
+                self.queue(Job::ExportPatch(args, destination));
             }
         });
         ui.add_space(12.0);
@@ -4220,6 +5013,81 @@ impl GitVibe {
                     });
                 });
         }
+        if let Some(path) = self.confirm_remove_worktree.clone() {
+            egui::Window::new("Remove worktree?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(path.display().to_string());
+                    ui.label("Git refuses removal when the worktree has uncommitted changes or is locked.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_remove_worktree = None;
+                        }
+                        if ui.add(egui::Button::new("Remove worktree").fill(red())).clicked() {
+                            self.git_owned(vec!["worktree".into(), "remove".into(), path.to_string_lossy().into_owned()]);
+                            self.confirm_remove_worktree = None;
+                        }
+                    });
+                });
+        }
+        if let Some(remote) = self.confirm_remove_remote.clone() {
+            egui::Window::new("Remove remote?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "Remove remote '{remote}' and its local tracking refs?"
+                    ));
+                    ui.label("Commits and the remote repository itself are not deleted.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_remove_remote = None;
+                        }
+                        if ui
+                            .add(egui::Button::new("Remove remote").fill(red()))
+                            .clicked()
+                        {
+                            self.git_owned(vec!["remote".into(), "remove".into(), remote]);
+                            self.confirm_remove_remote = None;
+                        }
+                    });
+                });
+        }
+        if let Some(args) = self.confirm_rebase.clone() {
+            let action_name = if args.iter().any(|arg| arg == "--abort") {
+                "Abort rebase"
+            } else if args.iter().any(|arg| arg == "--skip") {
+                "Skip current commit"
+            } else {
+                "Start rebase"
+            };
+            egui::Window::new(format!("{action_name}?"))
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(match action_name {
+                        "Abort rebase" => "Return to the branch state before this rebase began.",
+                        "Skip current commit" => "Omit this commit from the rebased branch.",
+                        _ => "Replay commits onto the selected target. Commit IDs will change.",
+                    });
+                    if action_name == "Start rebase" {
+                        ui.label(format!("Target: {}", args.last().unwrap_or(&String::new())));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_rebase = None;
+                        }
+                        if ui
+                            .add(egui::Button::new(action_name).fill(orange()))
+                            .clicked()
+                        {
+                            self.git_owned(args);
+                            self.confirm_rebase = None;
+                        }
+                    });
+                });
+        }
     }
 }
 
@@ -4238,6 +5106,14 @@ impl eframe::App for GitVibe {
         let ctx = ui.ctx().clone();
         self.poll();
         self.poll_updates();
+        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F)) {
+            self.page = Page::History;
+            ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("history_search")));
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::F5)) && !self.busy && self.repo.is_some()
+        {
+            self.queue(Job::Refresh);
+        }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -4280,8 +5156,14 @@ impl eframe::App for GitVibe {
                 ui.horizontal(|ui| {
                     if self.error.is_empty() {
                         ui.label(
-                            RichText::new(if self.busy { "Working..." } else { "Ready" })
-                                .color(accent()),
+                            RichText::new(if self.busy {
+                                "Working..."
+                            } else if self.notice.is_empty() {
+                                "Ready"
+                            } else {
+                                &self.notice
+                            })
+                            .color(accent()),
                         );
                     } else {
                         ui.label(RichText::new(format!("Error: {}", self.error)).color(red()));
@@ -4310,7 +5192,7 @@ impl eframe::App for GitVibe {
                         .inner_margin(egui::Margin::same(8)),
                 )
                 .show(ui, |ui| {
-                    let body_height = (ui.available_height() - 126.0).max(100.0);
+                    let body_height = (ui.available_height() - 220.0).max(100.0);
                     egui::ScrollArea::vertical()
                         .max_height(body_height)
                         .auto_shrink([false, false])
@@ -4371,6 +5253,10 @@ impl eframe::App for GitVibe {
                 Page::Changelog => self.changelog(ui),
                 Page::Branches => self.branches(ui),
                 Page::Stashes => self.stashes(ui),
+                Page::Worktrees => self.worktree_page(ui),
+                Page::Submodules => self.submodule_page(ui),
+                Page::Rebase => self.rebase_page(ui),
+                Page::PullRequests => self.pull_request_page(ui),
                 Page::Console => self.console(ui),
                 Page::Updates => self.updates_page(ui),
             });

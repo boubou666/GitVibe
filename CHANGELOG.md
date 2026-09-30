@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-30
+
+### Added
+
+- Worktree management for creating a checkout from HEAD or a selected commit, opening it as a repository, locking and unlocking it, removing clean worktrees, and pruning stale metadata.
+- Submodule management for adding, initializing, updating, syncing, and opening nested repositories with `.git` file support.
+- Rebase controls for replaying the current branch onto a chosen ref, autostashing local changes, resolving conflicts, continuing, skipping, and aborting.
+- A GitHub pull request view that lists recent PRs and creates one using the existing GitHub CLI login.
+- Keyboard shortcuts for commit search and repository refresh.
+- Export a commit or changed file as a patch, and apply a patch from disk.
+- Add and remove remotes and create annotated tags from the Branches & tags view.
+
+### Changed
+
+- Refresh repository state after a failed Git command so merge and rebase conflicts appear immediately.
+
 ## [0.6.0] - 2026-09-30
 
 ### Added
