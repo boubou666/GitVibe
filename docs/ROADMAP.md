@@ -40,11 +40,17 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 
 1. Guarded undo and redo for staging and unstaging files, hunks, and lines, including binary and initial-commit staging. The index is replayed only when the repository, branch, HEAD, and index still match.
 
+## Completed in 0.12.0
+
+1. File-aware syntax highlighting for unified and side by side diffs, retaining parser state within each old and new hunk stream.
+2. Keyboard navigation through changed files with Alt+Up and Alt+Down.
+3. Native AccessKit bridge, labels and selection state for custom-painted tabs, branches, and commit rows, and improved Aurora muted-text contrast.
+
 ## Next: GitKraken workflow parity
 
-1. **Diff review.** Improve syntax coloring with language-aware parsing. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
+1. **Diff review.** Add better state recovery across distant hunks and a syntax toggle for users who prefer plain text. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
 2. **Broader undo and redo.** Extend explicit recovery data beyond staging to safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
-3. **Accessibility.** Review focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
+3. **Accessibility.** Continue reviewing focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
 4. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
 
 ## Needs account or distribution decisions

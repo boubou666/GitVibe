@@ -1,6 +1,7 @@
 mod app;
 mod git;
 mod github;
+mod syntax;
 mod updates;
 
 fn main() -> eframe::Result {

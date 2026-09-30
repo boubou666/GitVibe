@@ -1,13 +1,17 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Command,
-    sync::mpsc::{self, Receiver},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver},
+    },
     thread,
 };
 
 use crate::{
     git::{self, Snapshot},
-    github, updates,
+    github, syntax, updates,
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 
@@ -17,7 +21,7 @@ const PANEL_ALT: Color32 = Color32::from_rgb(48, 52, 63);
 const ELEVATED: Color32 = Color32::from_rgb(53, 70, 99);
 const BORDER: Color32 = Color32::from_rgb(62, 68, 80);
 const TEXT: Color32 = Color32::from_rgb(234, 238, 245);
-const MUTED: Color32 = Color32::from_rgb(155, 166, 184);
+const MUTED: Color32 = Color32::from_rgb(174, 184, 201);
 const ACCENT: Color32 = Color32::from_rgb(61, 196, 230);
 const ORANGE: Color32 = Color32::from_rgb(255, 177, 96);
 const RED: Color32 = Color32::from_rgb(255, 111, 134);
@@ -415,6 +419,7 @@ pub struct GitVibe {
     diff_split: bool,
     diff_hunk_focus: usize,
     diff_scroll_pending: bool,
+    file_scroll_pending: bool,
     pr_base: String,
     pr_title: String,
     pr_body: String,
@@ -444,6 +449,7 @@ pub struct GitVibe {
     selected_file: Option<String>,
     selected_file_staged: bool,
     detail: String,
+    syntax_cache: HashMap<(String, String), Arc<syntax::HunkColors>>,
     output: String,
     notice: String,
     error: String,
@@ -636,6 +642,7 @@ impl GitVibe {
             diff_split: false,
             diff_hunk_focus: 0,
             diff_scroll_pending: false,
+            file_scroll_pending: false,
             pr_base: "main".to_owned(),
             pr_title: String::new(),
             pr_body: String::new(),
@@ -665,6 +672,7 @@ impl GitVibe {
             selected_file: None,
             selected_file_staged: false,
             detail: String::new(),
+            syntax_cache: HashMap::new(),
             output: String::new(),
             notice: String::new(),
             error: String::new(),
@@ -1415,7 +1423,7 @@ impl GitVibe {
                     ) {
                         self.run_pull_mode();
                     }
-                    ui.menu_button("v", |ui| {
+                    let pull_menu = ui.menu_button("v", |ui| {
                         ui.label(
                             RichText::new("Default pull action")
                                 .size(11.0)
@@ -1435,6 +1443,13 @@ impl GitVibe {
                                 ui.close();
                             }
                         }
+                    });
+                    pull_menu.response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Button,
+                            true,
+                            "Choose default pull action",
+                        )
                     });
                     if toolbar_action(ui, "Push") {
                         self.git(&["push"]);
@@ -1788,11 +1803,13 @@ impl GitVibe {
                 }
             }
             ui.add_space(5.0);
-            if ui
+            let new_tab = ui
                 .add(egui::Button::new(RichText::new("+").size(17.0).color(text())).frame(false))
-                .on_hover_text("New tab")
-                .clicked()
-            {
+                .on_hover_text("New tab");
+            new_tab.widget_info(|| {
+                egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "New tab")
+            });
+            if new_tab.clicked() {
                 self.new_tab_open = true;
                 self.page = Page::NewTab;
             }
@@ -2642,13 +2659,13 @@ impl GitVibe {
         if self.detail.is_empty() {
             ui.label(RichText::new("Loading commit diff...").color(muted()));
         } else {
-            let mut sections = Vec::<Vec<&str>>::new();
+            let mut sections = Vec::<Vec<String>>::new();
             for line in self.detail.lines() {
                 if line.starts_with("diff --git ") {
                     sections.push(Vec::new());
                 }
                 if let Some(section) = sections.last_mut() {
-                    section.push(line);
+                    section.push(line.to_owned());
                 }
             }
             if sections.is_empty() {
@@ -2684,6 +2701,7 @@ impl GitVibe {
                                 }
                             }
                             for hunk in hunks {
+                                let colors = self.syntax_hunk(path, &hunk);
                                 ui.add_space(9.0);
                                 egui::Frame::new()
                                     .fill(panel_alt())
@@ -2698,13 +2716,18 @@ impl GitVibe {
                                     });
                                 if self.diff_split {
                                     for row in hunk.split_rows() {
-                                        split_diff_row(ui, &row);
+                                        split_diff_row(ui, &row, &colors);
                                     }
                                 } else {
                                     let numbers = hunk.line_numbers();
                                     for (i, line) in hunk.lines.iter().enumerate() {
                                         let (old, new) = numbers[i];
-                                        diff_line_numbered(ui, line, old, new, None, false);
+                                        let spans = if line.starts_with('-') {
+                                            colors.old_line(old)
+                                        } else {
+                                            colors.new_line(new)
+                                        };
+                                        diff_line_numbered(ui, line, old, new, None, spans, false);
                                     }
                                 }
                             }
@@ -2931,6 +2954,32 @@ impl GitVibe {
             });
     }
 
+    fn select_changed_file(&mut self, file: &git::FileStatus, staged: bool) {
+        self.selected_file = Some(file.path.clone());
+        self.selected_file_staged = staged;
+        self.diff_hunk_focus = 0;
+        self.diff_scroll_pending = true;
+        self.file_scroll_pending = true;
+        self.selected_commit = None;
+        self.detail.clear();
+        if file.conflicted() {
+            self.queue(Job::InspectConflict(file.path.clone()));
+        } else if file.index == '?' {
+            self.queue(Job::InspectFile(file.path.clone()));
+        } else {
+            let mut args = vec![
+                "diff".to_owned(),
+                "--no-ext-diff".to_owned(),
+                "--no-color".to_owned(),
+            ];
+            if staged {
+                args.push("--cached".to_owned());
+            }
+            args.extend(["--".to_owned(), file.path.clone()]);
+            self.queue(Job::Inspect(args));
+        }
+    }
+
     fn file_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus, staged: bool) {
         let selected = self.selected_file.as_deref() == Some(&file.path)
             && self.selected_file_staged == staged;
@@ -2941,7 +2990,7 @@ impl GitVibe {
         } else {
             "EDITED"
         };
-        egui::Frame::new()
+        let row = egui::Frame::new()
             .fill(if selected { elevated() } else { panel() })
             .inner_margin(egui::Margin::symmetric(6, 1))
             .show(ui, |ui| {
@@ -2961,35 +3010,21 @@ impl GitVibe {
                         )
                         .clicked()
                     {
-                        self.selected_file = Some(file.path.clone());
-                        self.selected_file_staged = staged;
-                        self.diff_hunk_focus = 0;
-                        self.diff_scroll_pending = true;
-                        self.selected_commit = None;
-                        self.detail.clear();
-                        if file.index == '?' {
-                            self.queue(Job::InspectFile(file.path.clone()));
-                        } else {
-                            let mut args = vec![
-                                "diff".to_owned(),
-                                "--no-ext-diff".to_owned(),
-                                "--no-color".to_owned(),
-                            ];
-                            if staged {
-                                args.push("--cached".to_owned());
-                            }
-                            args.extend(["--".to_owned(), file.path.clone()]);
-                            self.queue(Job::Inspect(args));
-                        }
+                        self.select_changed_file(file, staged);
                     }
                 });
             });
+        if selected && self.file_scroll_pending {
+            ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+            self.file_scroll_pending = false;
+        }
         ui.add_space(1.0);
     }
 
     fn conflict_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus) {
-        egui::Frame::new()
-            .fill(panel_alt())
+        let selected = self.selected_file.as_deref() == Some(&file.path);
+        let row = egui::Frame::new()
+            .fill(if selected { elevated() } else { panel_alt() })
             .corner_radius(egui::CornerRadius::same(8))
             .stroke(Stroke::new(1.0, red()))
             .inner_margin(egui::Margin::symmetric(10, 7))
@@ -3004,10 +3039,7 @@ impl GitVibe {
                         )
                         .clicked()
                     {
-                        self.selected_file = Some(file.path.clone());
-                        self.selected_file_staged = false;
-                        self.selected_commit = None;
-                        self.queue(Job::InspectConflict(file.path.clone()));
+                        self.select_changed_file(file, false);
                     }
                     ui.add_enabled_ui(!self.busy, |ui| {
                         if action(ui, "Edit lines", true) {
@@ -3028,6 +3060,10 @@ impl GitVibe {
                     });
                 });
             });
+        if selected && self.file_scroll_pending {
+            ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+            self.file_scroll_pending = false;
+        }
         ui.add_space(4.0);
     }
 
@@ -4901,6 +4937,16 @@ impl GitVibe {
         }
     }
 
+    fn syntax_hunk(&mut self, path: &str, hunk: &git::DiffHunk) -> Arc<syntax::HunkColors> {
+        if self.syntax_cache.len() > 80 {
+            self.syntax_cache.clear();
+        }
+        self.syntax_cache
+            .entry((path.to_owned(), hunk.patch.clone()))
+            .or_insert_with(|| Arc::new(syntax::highlight_hunk(path, hunk)))
+            .clone()
+    }
+
     fn detail_view(&mut self, ui: &mut egui::Ui) {
         if !self.detail.is_empty() {
             ui.add_space(17.0);
@@ -4936,6 +4982,8 @@ impl GitVibe {
                     }
                 } else {
                     for (hunk_index, hunk) in hunks.into_iter().enumerate() {
+                        let syntax_path = self.selected_file.clone().unwrap_or_default();
+                        let colors = self.syntax_hunk(&syntax_path, &hunk);
                         let heading = egui::Frame::new()
                             .fill(panel_alt())
                             .corner_radius(egui::CornerRadius::same(7))
@@ -4992,7 +5040,7 @@ impl GitVibe {
                         }
                         if self.diff_split {
                             for row in hunk.split_rows().into_iter().take(400) {
-                                split_diff_row(ui, &row);
+                                split_diff_row(ui, &row, &colors);
                             }
                         } else {
                             let numbers = hunk.line_numbers();
@@ -5051,6 +5099,11 @@ impl GitVibe {
                                         old,
                                         new,
                                         counterpart,
+                                        if line.starts_with('-') {
+                                            colors.old_line(old)
+                                        } else {
+                                            colors.new_line(new)
+                                        },
                                         self.diff_wrap,
                                     );
                                 });
@@ -6083,6 +6136,60 @@ impl eframe::App for GitVibe {
                 }
             }
         }
+        if self.page == Page::Changes
+            && !self.palette_open
+            && !self.busy
+            && !ctx.text_edit_focused()
+        {
+            let direction = ctx.input(|input| {
+                if !input.modifiers.alt {
+                    0_i32
+                } else if input.key_pressed(egui::Key::ArrowDown) {
+                    1
+                } else if input.key_pressed(egui::Key::ArrowUp) {
+                    -1
+                } else {
+                    0
+                }
+            });
+            if direction != 0
+                && let Some(snapshot) = &self.snapshot
+            {
+                let files = snapshot
+                    .status
+                    .iter()
+                    .filter(|file| file.conflicted())
+                    .map(|file| (file.clone(), false))
+                    .chain(
+                        snapshot
+                            .status
+                            .iter()
+                            .filter(|file| file.unstaged() && !file.conflicted())
+                            .map(|file| (file.clone(), false)),
+                    )
+                    .chain(
+                        snapshot
+                            .status
+                            .iter()
+                            .filter(|file| file.staged() && !file.conflicted())
+                            .map(|file| (file.clone(), true)),
+                    )
+                    .collect::<Vec<_>>();
+                if !files.is_empty() {
+                    let current = files.iter().position(|(file, staged)| {
+                        self.selected_file.as_deref() == Some(&file.path)
+                            && self.selected_file_staged == *staged
+                    });
+                    let next = match (current, direction) {
+                        (Some(index), 1) => (index + 1).min(files.len() - 1),
+                        (Some(index), _) => index.saturating_sub(1),
+                        (None, 1) => 0,
+                        (None, _) => files.len() - 1,
+                    };
+                    self.select_changed_file(&files[next].0, files[next].1);
+                }
+            }
+        }
         if ctx.input(|input| input.key_pressed(egui::Key::F5)) && !self.busy && self.repo.is_some()
         {
             self.queue(Job::Refresh);
@@ -6303,7 +6410,7 @@ fn diff_line(ui: &mut egui::Ui, line: &str) {
     );
 }
 
-fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow) {
+fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow, colors: &syntax::HunkColors) {
     ui.columns(2, |columns| {
         if let Some(old) = &row.old {
             let counterpart = if old.line.starts_with('-') {
@@ -6317,6 +6424,7 @@ fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow) {
                 Some(old.number),
                 None,
                 counterpart,
+                colors.old_line(Some(old.number)),
                 false,
             );
         } else {
@@ -6334,6 +6442,7 @@ fn split_diff_row(ui: &mut egui::Ui, row: &git::SplitDiffRow) {
                 None,
                 Some(new.number),
                 counterpart,
+                colors.new_line(Some(new.number)),
                 false,
             );
         } else {
@@ -6348,6 +6457,7 @@ fn diff_line_numbered(
     old: Option<usize>,
     new: Option<usize>,
     other: Option<&str>,
+    spans: Option<&[syntax::Span]>,
     wrap: bool,
 ) {
     let added = line.starts_with('+');
@@ -6415,21 +6525,17 @@ fn diff_line_numbered(
                         .count();
                     let start = a[..prefix].iter().collect::<String>();
                     let middle = a[prefix..a.len() - suffix].iter().collect::<String>();
-                    let end = a[a.len() - suffix..].iter().collect::<String>();
-                    for (part, highlight) in [(start, false), (middle, true), (end, false)] {
-                        append_code_highlight(
-                            &mut job,
-                            &part,
-                            color,
-                            if highlight {
-                                elevated()
-                            } else {
-                                Color32::TRANSPARENT
-                            },
-                        );
-                    }
+                    let highlight_start = start.len();
+                    let highlight_end = highlight_start + middle.len();
+                    append_syntax_highlight(
+                        &mut job,
+                        content,
+                        spans,
+                        color,
+                        Some(highlight_start..highlight_end),
+                    );
                 } else {
-                    append_code_highlight(&mut job, content, color, Color32::TRANSPARENT);
+                    append_syntax_highlight(&mut job, content, spans, color, None);
                 }
                 ui.add(egui::Label::new(job).selectable(true).wrap_mode(if wrap {
                     egui::TextWrapMode::Wrap
@@ -6438,6 +6544,64 @@ fn diff_line_numbered(
                 }));
             });
         });
+}
+
+fn append_syntax_highlight(
+    job: &mut egui::text::LayoutJob,
+    content: &str,
+    spans: Option<&[syntax::Span]>,
+    base: Color32,
+    highlight: Option<std::ops::Range<usize>>,
+) {
+    let Some(spans) = spans.filter(|spans| !spans.is_empty()) else {
+        if let Some(highlight) = highlight {
+            append_code_highlight(job, &content[..highlight.start], base, Color32::TRANSPARENT);
+            append_code_highlight(job, &content[highlight.clone()], base, elevated());
+            append_code_highlight(job, &content[highlight.end..], base, Color32::TRANSPARENT);
+        } else {
+            append_code_highlight(job, content, base, Color32::TRANSPARENT);
+        }
+        return;
+    };
+    let mut boundaries = vec![0, content.len()];
+    for span in spans {
+        if span.start <= content.len() && span.end <= content.len() {
+            boundaries.extend([span.start, span.end]);
+        }
+    }
+    if let Some(highlight) = &highlight {
+        boundaries.extend([highlight.start, highlight.end]);
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
+    for pair in boundaries.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start == end {
+            continue;
+        }
+        let color = spans
+            .iter()
+            .find(|span| span.start <= start && span.end >= end)
+            .map_or(base, |span| span.color);
+        let background = if highlight
+            .as_ref()
+            .is_some_and(|range| range.start <= start && end <= range.end)
+        {
+            elevated()
+        } else {
+            Color32::TRANSPARENT
+        };
+        job.append(
+            &content[start..end],
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::monospace(11.0),
+                color,
+                background,
+                ..Default::default()
+            },
+        );
+    }
 }
 
 fn append_code_highlight(
@@ -6559,6 +6723,17 @@ fn paint_commit_row(
         egui::vec2(ui.available_width().max(graph_width + 500.0), 27.0),
         egui::Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            selected,
+            format!(
+                "Commit {}: {}, by {} on {}",
+                commit.short, commit.subject, commit.author, commit.date
+            ),
+        )
+    });
     let painter = ui.painter();
     painter.rect_filled(
         rect,
@@ -6716,6 +6891,9 @@ fn workspace_tab(
     width: f32,
 ) -> (bool, bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title)
+    });
     let fill = if selected { bg() } else { panel_alt() };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().line_segment(
@@ -6748,6 +6926,9 @@ fn workspace_tab(
         let close_response = ui
             .interact(close_rect, id.with("close"), egui::Sense::click())
             .on_hover_text("Close tab");
+        close_response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, format!("Close {title} tab"))
+        });
         if close_response.hovered() {
             ui.painter().rect_filled(close_rect, 3.0, elevated());
         }
@@ -6778,6 +6959,9 @@ fn sidebar_branch_row(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+    });
     if selected {
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(48, 87, 66));
