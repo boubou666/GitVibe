@@ -158,6 +158,13 @@ fn blue() -> Color32 {
     color(|p| p.blue)
 }
 
+fn dialog_input(value: &mut String, width: f32) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(value)
+        .desired_width(width)
+        .margin(egui::Margin::symmetric(12, 9))
+        .background_color(bg())
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Page {
     History,
@@ -451,6 +458,7 @@ pub struct GitVibe {
     active_profile: usize,
     sync_global_profile: bool,
     profile_draft: Profile,
+    profile_error: String,
     editing_profile: Option<usize>,
     preferences_return: Page,
     snapshot: Option<Snapshot>,
@@ -571,8 +579,15 @@ impl GitVibe {
         visuals.panel_fill = bg();
         visuals.window_fill = panel();
         visuals.window_stroke = Stroke::new(1.0, border());
+        visuals.window_corner_radius = egui::CornerRadius::same(9);
+        visuals.window_shadow = egui::Shadow {
+            offset: [0, 10],
+            blur: 28,
+            spread: 1,
+            color: Color32::from_black_alpha(140),
+        };
         visuals.extreme_bg_color = bg();
-        visuals.text_edit_bg_color = Some(panel_alt());
+        visuals.text_edit_bg_color = Some(bg());
         visuals.code_bg_color = panel_alt();
         visuals.widgets.inactive.bg_fill = panel_alt();
         visuals.widgets.inactive.weak_bg_fill = panel_alt();
@@ -635,9 +650,15 @@ impl GitVibe {
         visuals.panel_fill = bg();
         visuals.window_fill = panel();
         visuals.window_stroke = Stroke::new(1.0, border());
-        visuals.window_corner_radius = egui::CornerRadius::same(5);
+        visuals.window_corner_radius = egui::CornerRadius::same(9);
+        visuals.window_shadow = egui::Shadow {
+            offset: [0, 10],
+            blur: 28,
+            spread: 1,
+            color: Color32::from_black_alpha(140),
+        };
         visuals.extreme_bg_color = bg();
-        visuals.text_edit_bg_color = Some(panel_alt());
+        visuals.text_edit_bg_color = Some(bg());
         visuals.code_bg_color = panel_alt();
         visuals.widgets.inactive.bg_fill = panel_alt();
         visuals.widgets.inactive.weak_bg_fill = panel_alt();
@@ -666,6 +687,7 @@ impl GitVibe {
             s.spacing.item_spacing = egui::vec2(5.0, 4.0);
             s.spacing.button_padding = egui::vec2(8.0, 4.0);
             s.spacing.interact_size.y = 26.0;
+            s.spacing.window_margin = egui::Margin::symmetric(18, 16);
         });
         let recent_repos = cc
             .storage
@@ -723,6 +745,7 @@ impl GitVibe {
             active_profile,
             sync_global_profile,
             profile_draft,
+            profile_error: String::new(),
             editing_profile: None,
             preferences_return: Page::History,
             snapshot: None,
@@ -2218,19 +2241,17 @@ impl GitVibe {
         if !self.palette_open {
             return;
         }
+        let just_opened = self.palette_focus;
         let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
         let mut chosen = None;
-        egui::Window::new("Commands")
+        let palette = egui::Window::new("Commands")
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 82.0])
             .default_width(480.0)
             .show(ctx, |ui| {
-                let search = ui.add(
-                    egui::TextEdit::singleline(&mut self.palette_query)
-                        .hint_text("Search commands")
-                        .desired_width(460.0),
-                );
+                let search = ui
+                    .add(dialog_input(&mut self.palette_query, 460.0).hint_text("Search commands"));
                 if self.palette_focus {
                     search.request_focus();
                     self.palette_focus = false;
@@ -2305,11 +2326,23 @@ impl GitVibe {
                     }
                 }
                 ui.label(
-                    RichText::new("↑ ↓ to choose · Enter to run · Esc to close")
+                    RichText::new("Up/Down to choose · Enter to run · Esc to close")
                         .small()
                         .color(muted()),
                 );
             });
+        if !just_opened
+            && let Some(palette) = palette
+            && ctx.input(|input| {
+                input.pointer.any_click()
+                    && input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| !palette.response.rect.contains(pos))
+            })
+        {
+            close = true;
+        }
         if let Some(action) = chosen {
             self.run_palette_action(action, ctx);
             close = true;
@@ -2367,13 +2400,13 @@ impl GitVibe {
     fn save_profile_draft(&mut self) {
         let profile = self.profile_draft.clone().normalized();
         if let Err(error) = profile.validate() {
-            self.error = error.into();
+            self.profile_error = error.into();
             return;
         }
         if self.profiles.iter().enumerate().any(|(index, existing)| {
             Some(index) != self.editing_profile && existing.label == profile.label
         }) {
-            self.error = "Profile names must be unique".into();
+            self.profile_error = "Profile names must be unique".into();
             return;
         }
         let index = self.editing_profile.unwrap_or(self.profiles.len());
@@ -2384,7 +2417,7 @@ impl GitVibe {
             && self.sync_global_profile
             && let Err(error) = git::set_global_identity(&profile.name, &profile.email)
         {
-            self.error = format!("Could not update global Git identity: {error}");
+            self.profile_error = format!("Could not update global Git identity: {error}");
             return;
         }
         if index == self.profiles.len() {
@@ -2397,44 +2430,69 @@ impl GitVibe {
         if becomes_active {
             self.active_profile = index;
         }
-        self.error.clear();
+        self.profile_error.clear();
         self.notice = format!("Saved profile {}", profile.label);
     }
 
     fn profile_editor(&mut self, ui: &mut egui::Ui, first_launch: bool) {
-        ui.label(RichText::new("Profile name").size(11.0).color(muted()));
-        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.label).desired_width(340.0));
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Commit author name")
-                .size(11.0)
-                .color(muted()),
+        let width = ui.available_width().min(420.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(width);
+                for (label, value, hint) in [
+                    (
+                        "Profile name",
+                        &mut self.profile_draft.label,
+                        "e.g. Personal",
+                    ),
+                    (
+                        "Commit author name",
+                        &mut self.profile_draft.name,
+                        "Your name",
+                    ),
+                    (
+                        "Commit author email",
+                        &mut self.profile_draft.email,
+                        "you@example.com",
+                    ),
+                ] {
+                    ui.label(RichText::new(label).size(12.0).strong().color(muted()));
+                    ui.add_space(3.0);
+                    ui.add(dialog_input(value, width).hint_text(hint));
+                    ui.add_space(11.0);
+                }
+                if !self.profile_error.is_empty() {
+                    egui::Frame::new()
+                        .fill(red().gamma_multiply(0.14))
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.colored_label(red(), &self.profile_error);
+                        });
+                    ui.add_space(8.0);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let title = if first_launch {
+                        "Create profile"
+                    } else {
+                        "Save profile"
+                    };
+                    if ui
+                        .add_sized(
+                            [148.0, 36.0],
+                            egui::Button::new(RichText::new(title).strong().color(bg()))
+                                .fill(accent())
+                                .stroke(Stroke::NONE),
+                        )
+                        .clicked()
+                    {
+                        self.save_profile_draft();
+                    }
+                });
+            },
         );
-        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.name).desired_width(340.0));
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Commit author email")
-                .size(11.0)
-                .color(muted()),
-        );
-        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.email).desired_width(340.0));
-        ui.add_space(10.0);
-        if ui
-            .add(
-                egui::Button::new(if first_launch {
-                    "Create profile"
-                } else {
-                    "Save profile"
-                })
-                .fill(accent()),
-            )
-            .clicked()
-        {
-            self.save_profile_draft();
-        }
-        if !self.error.is_empty() {
-            ui.colored_label(red(), &self.error);
-        }
     }
 
     fn preferences_page(&mut self, ui: &mut egui::Ui) {
@@ -2442,7 +2500,22 @@ impl GitVibe {
             .auto_shrink([false, false])
             .show(ui, |ui| {
         ui.horizontal(|ui| {
-            if ui.button("← Back to workspace").clicked() {
+            let back = ui.button("      Back to workspace");
+            let center = egui::pos2(back.rect.left() + 13.0, back.rect.center().y);
+            let color = text();
+            ui.painter().line_segment(
+                [center + egui::vec2(4.0, 0.0), center + egui::vec2(-4.0, 0.0)],
+                Stroke::new(1.8, color),
+            );
+            ui.painter().line_segment(
+                [center + egui::vec2(-4.0, 0.0), center + egui::vec2(0.0, -4.0)],
+                Stroke::new(1.8, color),
+            );
+            ui.painter().line_segment(
+                [center + egui::vec2(-4.0, 0.0), center + egui::vec2(0.0, 4.0)],
+                Stroke::new(1.8, color),
+            );
+            if back.clicked() {
                 self.page = self.preferences_return;
             }
             ui.heading("Preferences");
@@ -2464,7 +2537,8 @@ impl GitVibe {
                     match git::set_global_identity(&profile.name, &profile.email) {
                         Ok(()) => self.sync_global_profile = true,
                         Err(error) => {
-                            self.error = format!("Could not update global Git identity: {error}")
+                            self.profile_error =
+                                format!("Could not update global Git identity: {error}")
                         }
                     }
                 } else {
@@ -2536,7 +2610,7 @@ impl GitVibe {
                     name: String::new(),
                     email: String::new(),
                 };
-                self.error.clear();
+                self.profile_error.clear();
             }
         });
         self.profile_editor(ui, false);
@@ -2547,12 +2621,54 @@ impl GitVibe {
         if !self.profiles.is_empty() {
             return;
         }
-        egui::Modal::new(egui::Id::new("first_commit_profile")).show(ctx, |ui| {
-            ui.heading("Set up your commit profile");
-            ui.label("Enter the author name and email GitVibe will use for your commits.");
-            ui.add_space(8.0);
-            self.profile_editor(ui, true);
-        });
+        let frame = egui::Frame::new()
+            .fill(panel())
+            .stroke(Stroke::new(1.0, border()))
+            .corner_radius(egui::CornerRadius::same(10))
+            .shadow(egui::Shadow {
+                offset: [0, 16],
+                blur: 36,
+                spread: 2,
+                color: Color32::from_black_alpha(170),
+            })
+            .inner_margin(egui::Margin::symmetric(24, 22));
+        egui::Modal::new(egui::Id::new("first_commit_profile"))
+            .frame(frame)
+            .backdrop_color(Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.label(
+                    RichText::new("GITVIBE  /  FIRST STEP")
+                        .size(10.0)
+                        .strong()
+                        .color(accent()),
+                );
+                ui.add_space(7.0);
+                ui.label(
+                    RichText::new("Make your commits yours")
+                        .size(21.0)
+                        .strong()
+                        .color(text()),
+                );
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new(
+                        "Choose the name and email that will appear in your commit history.",
+                    )
+                    .size(12.5)
+                    .color(muted()),
+                );
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(15.0);
+                self.profile_editor(ui, true);
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new("You can add or switch profiles later in Preferences.")
+                        .size(11.0)
+                        .color(muted()),
+                );
+            });
     }
 
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
@@ -3089,46 +3205,58 @@ impl GitVibe {
         }
     }
     fn history(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Viewing history").size(11.0).color(muted()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                const SEARCH_CONTROL_HEIGHT: f32 = 28.0;
-                ui.add_space(12.0);
-                if ui
-                    .add_sized([72.0, SEARCH_CONTROL_HEIGHT], egui::Button::new("Clear"))
-                    .clicked()
-                {
-                    self.search.clear();
-                    self.search_active = false;
-                    self.search_results.clear();
-                }
-                if ui
-                    .add_enabled_ui(!self.busy && !self.search.trim().is_empty(), |ui| {
-                        ui.add_sized([72.0, SEARCH_CONTROL_HEIGHT], egui::Button::new("Search"))
-                    })
-                    .inner
-                    .clicked()
-                {
-                    self.queue(Job::SearchHistory(self.search.clone()));
-                }
-                let search_edit = ui.add_sized(
-                    [250.0, SEARCH_CONTROL_HEIGHT],
-                    egui::TextEdit::singleline(&mut self.search)
-                        .id(egui::Id::new("history_search"))
-                        .hint_text("Search commits, authors or SHA")
-                        .desired_width(250.0),
-                );
-                if search_edit.changed() {
-                    self.search_active = false;
-                }
-                if search_edit.has_focus()
-                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                    && !self.search.trim().is_empty()
-                {
-                    self.queue(Job::SearchHistory(self.search.clone()));
-                }
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: 12,
+                right: 12,
+                top: 8,
+                bottom: 8,
+            })
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Viewing history").size(11.0).color(muted()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        const SEARCH_CONTROL_HEIGHT: f32 = 28.0;
+                        ui.add_space(12.0);
+                        if ui
+                            .add_sized([72.0, SEARCH_CONTROL_HEIGHT], egui::Button::new("Clear"))
+                            .clicked()
+                        {
+                            self.search.clear();
+                            self.search_active = false;
+                            self.search_results.clear();
+                        }
+                        if ui
+                            .add_enabled_ui(!self.busy && !self.search.trim().is_empty(), |ui| {
+                                ui.add_sized(
+                                    [72.0, SEARCH_CONTROL_HEIGHT],
+                                    egui::Button::new("Search"),
+                                )
+                            })
+                            .inner
+                            .clicked()
+                        {
+                            self.queue(Job::SearchHistory(self.search.clone()));
+                        }
+                        let search_edit = ui.add_sized(
+                            [250.0, SEARCH_CONTROL_HEIGHT],
+                            egui::TextEdit::singleline(&mut self.search)
+                                .id(egui::Id::new("history_search"))
+                                .hint_text("Search commits, authors or SHA")
+                                .desired_width(250.0),
+                        );
+                        if search_edit.changed() {
+                            self.search_active = false;
+                        }
+                        if search_edit.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            && !self.search.trim().is_empty()
+                        {
+                            self.queue(Job::SearchHistory(self.search.clone()));
+                        }
+                    });
+                });
             });
-        });
         ui.separator();
         let Some(snapshot) = self.snapshot.clone() else {
             self.empty(ui);
@@ -3953,15 +4081,23 @@ impl GitVibe {
             && self.selected_files.iter().any(|path| path == &file.path);
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+        let row_hovered = ui.input(|input| {
+            input
+                .pointer
+                .hover_pos()
+                .is_some_and(|position| rect.contains(position))
+        });
         response.widget_info(|| {
             egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &file.path)
         });
         ui.painter().rect_filled(
             rect,
             3.0,
-            if selected {
+            if selected && row_hovered {
+                elevated().gamma_multiply(1.2)
+            } else if selected {
                 elevated()
-            } else if response.hovered() {
+            } else if row_hovered {
                 panel_alt()
             } else {
                 panel()
@@ -3974,7 +4110,7 @@ impl GitVibe {
                 accent(),
             );
         }
-        if response.hovered() {
+        if row_hovered {
             ui.painter().rect_stroke(
                 rect,
                 3.0,
@@ -3989,7 +4125,7 @@ impl GitVibe {
             egui::FontId::proportional(11.0),
             if staged { accent() } else { orange() },
         );
-        let show_stage = response.hovered() && !self.busy;
+        let show_stage = row_hovered && !self.busy;
         let stage_rect = egui::Rect::from_center_size(
             egui::pos2(rect.right() - 42.0, rect.center().y),
             egui::vec2(72.0, 23.0),
@@ -4022,9 +4158,16 @@ impl GitVibe {
                         .stroke(Stroke::new(1.0, if staged { accent() } else { orange() })),
                 )
                 .clicked();
+        let stage_target = show_stage
+            && ui.input(|input| {
+                input
+                    .pointer
+                    .interact_pos()
+                    .is_some_and(|position| stage_rect.contains(position))
+            });
         if stage_clicked {
             self.stage_file_paths(vec![file.path.clone()], staged);
-        } else if response.clicked() {
+        } else if response.clicked() && !stage_target {
             let additive = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
             if additive && self.selected_file_staged == staged && !self.selected_files.is_empty() {
                 if let Some(index) = self
@@ -5235,11 +5378,11 @@ impl GitVibe {
                                         );
                                     }
                                 });
-                            if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                            if ui.add_enabled(index > 0, egui::Button::new("Up")).clicked() {
                                 move_to = Some((index, index - 1));
                             }
                             if ui
-                                .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                                .add_enabled(index + 1 < count, egui::Button::new("Down"))
                                 .clicked()
                             {
                                 move_to = Some((index, index + 1));
@@ -5821,7 +5964,7 @@ impl GitVibe {
                         if ui
                             .add_enabled(
                                 self.diff_hunk_focus > 0,
-                                egui::Button::new("↑ Previous change"),
+                                egui::Button::new("Previous change"),
                             )
                             .clicked()
                         {
@@ -5836,7 +5979,7 @@ impl GitVibe {
                         if ui
                             .add_enabled(
                                 self.diff_hunk_focus + 1 < hunk_count,
-                                egui::Button::new("Next change ↓"),
+                                egui::Button::new("Next change"),
                             )
                             .clicked()
                         {
@@ -6092,12 +6235,8 @@ impl GitVibe {
                     let files = self.commit_files.clone();
                     for file in files {
                         let selected = self.selected_commit_file.as_deref() == Some(&file.path);
-                        egui::Frame::new()
-                            .fill(if selected {
-                                elevated()
-                            } else {
-                                Color32::TRANSPARENT
-                            })
+                        let background = ui.painter().add(egui::Shape::Noop);
+                        let row = egui::Frame::new()
                             .inner_margin(egui::Margin::symmetric(6, 2))
                             .show(ui, |ui| {
                                 ui.set_min_width(ui.available_width());
@@ -6147,6 +6286,25 @@ impl GitVibe {
                                     }
                                 });
                             });
+                        let hovered = ui.input(|input| {
+                            input
+                                .pointer
+                                .hover_pos()
+                                .is_some_and(|position| row.response.rect.contains(position))
+                        });
+                        let fill = if selected && hovered {
+                            elevated().gamma_multiply(1.2)
+                        } else if selected {
+                            elevated()
+                        } else if hovered {
+                            panel_alt()
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter().set(
+                            background,
+                            egui::Shape::rect_filled(row.response.rect, 4.0, fill),
+                        );
                     }
                 }
             }
@@ -6958,7 +7116,7 @@ impl GitVibe {
                         RefAtKind::Branch => &mut self.branch_input,
                         RefAtKind::Tag => &mut self.tag_input,
                     };
-                    ui.add(egui::TextEdit::singleline(name).desired_width(300.0));
+                    ui.add(dialog_input(name, 320.0));
                     let value = name.trim().to_owned();
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -7016,13 +7174,13 @@ impl GitVibe {
                             ui.heading("Clone a Repo");
                             ui.add_space(16.0);
                             ui.horizontal(|ui| {
-                                ui.add_sized([135.0, 26.0], egui::Label::new("Where to clone to"));
+                                ui.add_sized([135.0, 38.0], egui::Label::new("Where to clone to"));
                                 ui.add_sized(
-                                    [405.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.clone_destination)
+                                    [405.0, 38.0],
+                                    dialog_input(&mut self.clone_destination, 405.0)
                                         .hint_text("Destination folder"),
                                 );
-                                if ui.button("Browse").clicked()
+                                if ui.add_sized([70.0, 38.0], egui::Button::new("Browse")).clicked()
                                     && let Some(parent) = pick_folder(
                                         Path::new(&self.clone_destination)
                                             .parent()
@@ -7036,10 +7194,10 @@ impl GitVibe {
                             });
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
-                                ui.add_sized([135.0, 26.0], egui::Label::new("URL or local path"));
+                                ui.add_sized([135.0, 38.0], egui::Label::new("URL or local path"));
                                 ui.add_sized(
-                                    [490.0, 26.0],
-                                    egui::TextEdit::singleline(&mut self.clone_url)
+                                    [490.0, 38.0],
+                                    dialog_input(&mut self.clone_url, 490.0)
                                         .hint_text(SOURCES[self.clone_source].1),
                                 );
                             });
@@ -7214,7 +7372,7 @@ impl GitVibe {
                     });
                     if self.reset_mode == ResetMode::Hard {
                         ui.label("Type RESET to confirm the hard reset:");
-                        ui.add(egui::TextEdit::singleline(&mut self.reset_confirmation));
+                        ui.add(dialog_input(&mut self.reset_confirmation, 320.0));
                     }
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
@@ -7316,7 +7474,7 @@ impl GitVibe {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("Fetch and push URL");
-                    ui.add(egui::TextEdit::singleline(&mut url).desired_width(480.0));
+                    ui.add(dialog_input(&mut url, 480.0));
                     ui.horizontal(|ui| {
                         cancel = ui.button("Cancel").clicked();
                         save = ui
@@ -8536,11 +8694,47 @@ fn toolbar_button_with_corner(
         );
     };
     match label {
-        "Undo" | "Redo" | "Refresh" => {
+        "Undo" | "Redo" => {
             let flip = if label == "Redo" { -1.0 } else { 1.0 };
-            ui.painter().circle_stroke(c, 4.3, stroke);
-            line((-5.6 * flip, -3.7), (-1.6 * flip, -3.7));
-            line((-5.6 * flip, -3.7), (-5.6 * flip, 0.3));
+            let points = [
+                (5.0, 4.4),
+                (5.0, 1.4),
+                (3.8, -1.2),
+                (1.6, -2.9),
+                (-1.1, -3.2),
+                (-5.0, -3.2),
+            ];
+            ui.painter().add(egui::Shape::line(
+                points
+                    .into_iter()
+                    .map(|(x, y)| egui::pos2(c.x + x * flip, c.y + y))
+                    .collect(),
+                Stroke::new(1.8, color),
+            ));
+            let tip = (-5.0 * flip, -3.2);
+            line(tip, (-1.8 * flip, -5.5));
+            line(tip, (-1.8 * flip, -0.9));
+        }
+        "Refresh" => {
+            let points = [
+                (3.6, -3.0),
+                (1.5, -4.7),
+                (-1.4, -4.8),
+                (-4.1, -2.8),
+                (-4.8, 0.3),
+                (-3.3, 3.4),
+                (-0.3, 4.7),
+                (2.8, 3.5),
+            ];
+            ui.painter().add(egui::Shape::line(
+                points
+                    .into_iter()
+                    .map(|(x, y)| egui::pos2(c.x + x, c.y + y))
+                    .collect(),
+                Stroke::new(1.8, color),
+            ));
+            line((2.8, 3.5), (0.1, 2.3));
+            line((2.8, 3.5), (3.1, 0.5));
         }
         "Fetch" | "Pull" | "Push" => {
             let up = label == "Push";
