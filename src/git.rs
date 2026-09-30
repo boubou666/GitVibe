@@ -514,10 +514,24 @@ pub fn init(path: &Path) -> Result<PathBuf, String> {
     discover(path)
 }
 
-pub fn clone_repo(url: &str, destination: &Path) -> Result<PathBuf, String> {
+pub fn clone_repo_with_options(
+    url: &str,
+    destination: &Path,
+    shallow: bool,
+    sparse: bool,
+) -> Result<PathBuf, String> {
     let destination_arg = destination.to_string_lossy().into_owned();
     let mut args = vec!["clone"];
-    if Path::new(url).exists() {
+    if shallow {
+        args.push("--depth=1");
+    }
+    if sparse {
+        args.push("--sparse");
+    }
+    if shallow && Path::new(url).exists() {
+        // Git ignores --depth with its default local hard-link optimization.
+        args.push("--no-local");
+    } else if Path::new(url).exists() {
         args.push("--local");
     }
     args.extend(["--", url, &destination_arg]);
@@ -799,60 +813,6 @@ fn refs(repo: &Path, prefix: &str) -> Result<Vec<Ref>, String> {
         .collect())
 }
 
-pub fn split_command(input: &str) -> Result<Vec<String>, String> {
-    let mut args = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut started = false;
-    let mut escaped = false;
-    for ch in input.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            started = true;
-            continue;
-        }
-        match ch {
-            '\\' if quote == Some('"') => {
-                escaped = true;
-            }
-            '\'' | '"' if quote == Some(ch) => {
-                quote = None;
-            }
-            '\'' | '"' if quote.is_none() => {
-                quote = Some(ch);
-                started = true;
-            }
-            c if c.is_whitespace() && quote.is_none() => {
-                if started {
-                    args.push(std::mem::take(&mut current));
-                    started = false;
-                }
-            }
-            _ => {
-                current.push(ch);
-                started = true;
-            }
-        }
-    }
-    if escaped || quote.is_some() {
-        return Err("Unclosed quote or escape".into());
-    }
-    if started {
-        args.push(current);
-    }
-    if args
-        .first()
-        .is_some_and(|first| first.eq_ignore_ascii_case("git"))
-    {
-        args.remove(0);
-    }
-    if args.is_empty() {
-        return Err("Enter a Git command".into());
-    }
-    Ok(args)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,18 +833,6 @@ mod tests {
     }
 
     #[test]
-    fn splits_quoted_git_command_without_shell() {
-        assert_eq!(
-            split_command("git commit -m 'hello world'").unwrap(),
-            ["commit", "-m", "hello world"]
-        );
-        assert_eq!(
-            split_command("git add -- \"a file.txt\"").unwrap(),
-            ["add", "--", "a file.txt"]
-        );
-    }
-
-    #[test]
     fn suggests_clone_folder_for_https_ssh_and_local_repositories() {
         assert_eq!(
             default_clone_directory("https://github.com/example/my-repo.git"),
@@ -898,6 +846,46 @@ mod tests {
             default_clone_directory("C:\\projects\\local-repo"),
             Some("local-repo".into())
         );
+    }
+
+    #[test]
+    fn opens_worktree_with_gitfile_and_external_git_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("gitvibe-gitfile-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let worktree = base.join("worktree");
+        let metadata = base.join("metadata");
+        let metadata_arg = metadata.to_string_lossy().into_owned();
+        let worktree_arg = worktree.to_string_lossy().into_owned();
+        let result = git_output(
+            None,
+            &["init", "--separate-git-dir", &metadata_arg, &worktree_arg],
+        )
+        .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(worktree.join(".git").is_file());
+        assert!(metadata.join("HEAD").is_file());
+        assert_eq!(
+            discover(&worktree).unwrap().canonicalize().unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+        assert_eq!(
+            snapshot_with_limit(&worktree, 20)
+                .unwrap()
+                .root
+                .canonicalize()
+                .unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -998,10 +986,20 @@ mod tests {
         assert_eq!(snapshot_with_limit(&root, 2).unwrap().commits.len(), 2);
         assert!(!snapshot_with_limit(&root, 2).unwrap().has_more_commits);
         let clone_path = root.with_extension("cloned repository");
-        let cloned = clone_repo(&root.to_string_lossy(), &clone_path).unwrap();
+        let cloned =
+            clone_repo_with_options(&root.to_string_lossy(), &clone_path, false, false).unwrap();
         let clone_snapshot = snapshot(&cloned).unwrap();
         assert_eq!(clone_snapshot.commits.len(), 2);
         assert!(!clone_snapshot.remote_branches.is_empty());
+        let sparse_path = root.with_extension("sparse shallow clone");
+        let sparse =
+            clone_repo_with_options(&root.to_string_lossy(), &sparse_path, true, true).unwrap();
+        assert_eq!(snapshot(&sparse).unwrap().commits.len(), 1);
+        assert_eq!(
+            run(&sparse, &["config", "--get", "core.sparseCheckout"]).unwrap(),
+            "true"
+        );
+        std::fs::remove_dir_all(sparse).unwrap();
         std::fs::remove_dir_all(cloned).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

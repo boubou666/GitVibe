@@ -31,6 +31,8 @@ mod dark_titlebar {
     unsafe extern "system" {
         fn EnumWindows(callback: extern "system" fn(Hwnd, isize) -> i32, param: isize) -> i32;
         fn GetWindowThreadProcessId(window: Hwnd, process_id: *mut u32) -> u32;
+        fn IsWindowVisible(window: Hwnd) -> i32;
+        fn GetWindowTextW(window: Hwnd, text: *mut u16, max_count: i32) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -55,14 +57,24 @@ mod dark_titlebar {
         if process_id != search.process_id {
             return 1;
         }
+        if unsafe { IsWindowVisible(window) } == 0 {
+            return 1;
+        }
+        let mut title = [0_u16; 64];
+        let length = unsafe { GetWindowTextW(window, title.as_mut_ptr(), title.len() as i32) };
+        if length == 0 || String::from_utf16_lossy(&title[..length as usize]) != "GitVibe" {
+            return 1;
+        }
         let dark = 1_i32;
         let value = &dark as *const i32 as *const c_void;
         let size = std::mem::size_of::<i32>() as u32;
         let result = unsafe { DwmSetWindowAttribute(window, 20, value, size) };
-        if result != 0 {
-            unsafe { DwmSetWindowAttribute(window, 19, value, size) };
-        }
-        search.found = true;
+        let result = if result != 0 {
+            unsafe { DwmSetWindowAttribute(window, 19, value, size) }
+        } else {
+            result
+        };
+        search.found = result == 0;
         0
     }
 

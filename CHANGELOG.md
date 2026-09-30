@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Structured file history with revision diffs and file previews, plus changed-file lists in the commit inspector.
 - Numbered diff lines with highlighted edits and individual line staging and unstaging.
 - A visual conflict editor for selecting lines from either side, editing the result, and staging the resolved file.
+- A New Tab page for opening, cloning, and creating repositories, plus repository and branch pickers in the top bar.
+- A repository shell dock with command history, working directory navigation, and PowerShell or POSIX shell commands.
+- A regression test for repositories whose `.git` file points to metadata stored outside the working tree.
+- A two-column clone dialog with source URL presets, destination browsing, shallow clone, and sparse checkout.
 
 ### Changed
 
@@ -27,6 +31,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Grouped local and remote branches in the rail with a filter; clicking a branch returns to its graph commit.
 - Added a commit right-click menu for checkout, creating branches and tags, reset, cherry-pick, revert, comparisons, and copying the SHA.
 - Moved commit patches into a wide center view so the inspector stays focused on commit details and changed files.
+- Rendered commit patches by file and hunk with line numbers; selecting a changed file opens its patch in the center view.
+- Added inline branch naming at a commit, author badges and names in the graph, collapsible branch groups, and double-click branch switching with choices for local changes.
+- Added pull-mode choices to the toolbar arrow and centered the Git actions.
+- Improved working-tree diff rows with syntax cues, full-width change highlights, and compact hunk controls.
+- Fixed zoom growth across launches, aligned repository action button heights, and highlighted the selected file in both inspector lists.
 
 ## [0.5.0] - 2026-09-30
 

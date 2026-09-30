@@ -1,5 +1,6 @@
 use std::{
     path::{Path, PathBuf},
+    process::Command,
     sync::mpsc::{self, Receiver},
     thread,
 };
@@ -154,6 +155,7 @@ enum Page {
     History,
     Changes,
     CommitDiff,
+    NewTab,
     Repositories,
     Changelog,
     Branches,
@@ -202,11 +204,32 @@ enum ResetMode {
     Hard,
 }
 
+#[derive(Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+enum PullMode {
+    FetchAll,
+    Merge,
+    FastForwardOnly,
+    Rebase,
+}
+
+impl PullMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FetchAll => "Fetch all",
+            Self::Merge => "Pull (fast-forward if possible)",
+            Self::FastForwardOnly => "Pull (fast-forward only)",
+            Self::Rebase => "Pull (rebase)",
+        }
+    }
+}
+
 enum Job {
     Open(PathBuf),
     Init(PathBuf),
-    Clone(String, PathBuf),
+    Clone(String, PathBuf, bool, bool),
     Run(Vec<String>),
+    SwitchBranch(String, bool, bool),
+    Shell(String, PathBuf),
     Inspect(Vec<String>),
     InspectCommit(String),
     InspectFile(String),
@@ -225,6 +248,7 @@ enum Job {
 enum Done {
     Loaded(Result<Snapshot, String>),
     Ran(Result<(String, Snapshot), String>),
+    Shell(Result<String, String>),
     Inspected(Result<String, String>),
     CommitInspected(String, Result<(String, Vec<git::CommitFile>), String>),
     Searched(Result<(Vec<git::Commit>, bool), String>),
@@ -237,22 +261,34 @@ pub struct GitVibe {
     open_repo_tabs: Vec<PathBuf>,
     last_active_repo: Option<PathBuf>,
     changelog_open: bool,
+    new_tab_open: bool,
     recent_repos: Vec<PathBuf>,
     pinned_repos: Vec<PathBuf>,
     repo_filter: String,
     branch_filter: String,
     theme_choice: ThemeChoice,
+    pull_mode: PullMode,
     snapshot: Option<Snapshot>,
     page: Page,
     path_input: String,
     clone_url: String,
     clone_destination: String,
+    clone_source: usize,
+    clone_shallow: bool,
+    clone_sparse: bool,
     branch_input: String,
     tag_input: String,
     commit_message: String,
     command_input: String,
+    terminal_output: String,
+    terminal_cwd: Option<PathBuf>,
+    command_history: Vec<String>,
+    command_history_index: usize,
     terminal_open: bool,
     selected_commit: Option<String>,
+    selected_commit_file: Option<String>,
+    inline_branch_at: Option<String>,
+    confirm_switch_branch: Option<(String, bool)>,
     commit_files: Vec<git::CommitFile>,
     commit_files_id: Option<String>,
     compare_base: Option<String>,
@@ -320,13 +356,16 @@ impl GitVibe {
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx
-            .set_pixels_per_point(cc.egui_ctx.pixels_per_point() * 1.16);
+        cc.egui_ctx.set_zoom_factor(1.16);
         cc.egui_ctx.set_theme(egui::Theme::Dark);
         let theme_choice = cc
             .storage
             .and_then(|storage| eframe::get_value::<ThemeChoice>(storage, "theme_choice"))
             .unwrap_or(ThemeChoice::Aurora);
+        let pull_mode = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<PullMode>(storage, "pull_mode"))
+            .unwrap_or(PullMode::Merge);
         PALETTE.with(|palette| palette.set(Palette::for_choice(theme_choice)));
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(text());
@@ -408,22 +447,34 @@ impl GitVibe {
             open_repo_tabs,
             last_active_repo,
             changelog_open,
+            new_tab_open: false,
             recent_repos,
             pinned_repos,
             repo_filter: String::new(),
             branch_filter: String::new(),
             theme_choice,
+            pull_mode,
             snapshot: None,
             page: Page::History,
             path_input: path.to_string_lossy().into_owned(),
             clone_url: String::new(),
             clone_destination: String::new(),
+            clone_source: 0,
+            clone_shallow: false,
+            clone_sparse: false,
             branch_input: String::new(),
             tag_input: String::new(),
             commit_message: String::new(),
             command_input: String::new(),
+            terminal_output: String::new(),
+            terminal_cwd: None,
+            command_history: Vec::new(),
+            command_history_index: 0,
             terminal_open: false,
             selected_commit: None,
+            selected_commit_file: None,
+            inline_branch_at: None,
+            confirm_switch_branch: None,
             commit_files: Vec::new(),
             commit_files_id: None,
             compare_base: None,
@@ -516,7 +567,7 @@ impl GitVibe {
 
     fn queue(&mut self, job: Job) {
         if !self.busy {
-            if matches!(&job, Job::Open(_) | Job::Init(_) | Job::Clone(_, _)) {
+            if matches!(&job, Job::Open(_) | Job::Init(_) | Job::Clone(_, _, _, _)) {
                 self.history_limit = 300;
             }
             self.pending = Some(job);
@@ -545,8 +596,8 @@ impl GitVibe {
                 Job::Init(path) => Done::Loaded(
                     git::init(&path).and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
-                Job::Clone(url, path) => Done::Loaded(
-                    git::clone_repo(&url, &path)
+                Job::Clone(url, path, shallow, sparse) => Done::Loaded(
+                    git::clone_repo_with_options(&url, &path, shallow, sparse)
                         .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
                 Job::Refresh => Done::Loaded(
@@ -561,6 +612,35 @@ impl GitVibe {
                             Ok((output, snapshot))
                         }),
                 ),
+                Job::SwitchBranch(name, stash_first, remote) => Done::Ran(
+                    repo.ok_or("No repository selected".to_owned()).and_then(|p| {
+                        let mut output = String::new();
+                        let previous_stash = git::run(&p, &["rev-parse", "-q", "--verify", "refs/stash"]).ok();
+                        let mut created_stash = false;
+                        if stash_first {
+                            output.push_str(&git::run(&p, &["stash", "push", "-u", "-m", "GitVibe branch switch"])?);
+                            output.push('\n');
+                            created_stash = git::run(&p, &["rev-parse", "-q", "--verify", "refs/stash"]).ok() != previous_stash;
+                        }
+                        let command = if remote { vec!["switch", "--track", name.as_str()] } else { vec!["switch", name.as_str()] };
+                        match git::run(&p, &command) {
+                            Ok(switched) => output.push_str(&switched),
+                            Err(error) => {
+                                if created_stash {
+                                    let restore = git::run(&p, &["stash", "pop"]);
+                                    return Err(match restore {
+                                        Ok(_) => format!("{error}\nYour changes were restored from the temporary stash."),
+                                        Err(restore_error) => format!("{error}\nThe temporary stash was kept because restoring it failed: {restore_error}"),
+                                    });
+                                }
+                                return Err(error);
+                            }
+                        }
+                        let snapshot = git::snapshot_with_limit(&p, history_limit)?;
+                        Ok((output, snapshot))
+                    }),
+                ),
+                Job::Shell(command, cwd) => Done::Shell(run_shell_command(&cwd, &command)),
                 Job::Inspect(args) => Done::Inspected(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| git::run_owned(&p, &args)),
@@ -672,6 +752,8 @@ impl GitVibe {
             Done::Loaded(result) => match result {
                 Ok(snapshot) => {
                     if self.repo.as_ref() != Some(&snapshot.root) {
+                        self.terminal_cwd = Some(snapshot.root.clone());
+                        self.terminal_output.clear();
                         self.selected_commit = None;
                         self.selected_file = None;
                         self.detail.clear();
@@ -685,6 +767,9 @@ impl GitVibe {
                         self.commit_files_id = None;
                     }
                     self.repo = Some(snapshot.root.clone());
+                    if self.terminal_cwd.is_none() {
+                        self.terminal_cwd = Some(snapshot.root.clone());
+                    }
                     self.last_active_repo = Some(snapshot.root.clone());
                     self.path_input = snapshot.root.to_string_lossy().into_owned();
                     self.recent_repos.retain(|path| path != &snapshot.root);
@@ -707,9 +792,31 @@ impl GitVibe {
             },
             Done::Ran(result) => match result {
                 Ok((output, snapshot)) => {
+                    let branch_changed = self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|current| current.branch != snapshot.branch);
+                    let new_head = if branch_changed {
+                        snapshot
+                            .branches
+                            .iter()
+                            .find(|branch| branch.current)
+                            .and_then(|branch| {
+                                snapshot
+                                    .commits
+                                    .iter()
+                                    .find(|commit| commit.short == branch.target)
+                            })
+                            .map(|commit| commit.id.clone())
+                    } else {
+                        None
+                    };
                     self.output = output;
                     self.repo = Some(snapshot.root.clone());
                     self.snapshot = Some(snapshot);
+                    if let Some(id) = new_head {
+                        self.select_commit(&id);
+                    }
                     self.error.clear();
                     if self.committing {
                         self.commit_message.clear();
@@ -767,6 +874,19 @@ impl GitVibe {
                 }
                 Err(error) => self.error = error,
             },
+            Done::Shell(result) => match result {
+                Ok(output) => {
+                    self.terminal_output.push_str(&output);
+                    if !output.ends_with('\n') {
+                        self.terminal_output.push('\n');
+                    }
+                    self.error.clear();
+                }
+                Err(error) => {
+                    self.terminal_output.push_str(&format!("{error}\n"));
+                    self.error = error;
+                }
+            },
             Done::CommitInspected(id, result) => match result {
                 Ok((detail, files)) => {
                     if self.selected_commit.as_deref() == Some(&id) {
@@ -822,22 +942,75 @@ impl GitVibe {
             }
         });
         let changed = self.snapshot.as_ref().map(|snapshot| snapshot.status.len());
+        let local_branches = self
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.branches.clone())
+            .unwrap_or_default();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("repository").size(10.0).color(muted()));
-                ui.label(
-                    RichText::new(repo_name.as_deref().unwrap_or("No repository"))
-                        .size(14.0)
-                        .strong()
-                        .color(text()),
-                );
+                ui.menu_button(repo_name.as_deref().unwrap_or("No repository"), |ui| {
+                    ui.set_min_width(230.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.repo_filter)
+                            .hint_text("Search repositories"),
+                    );
+                    ui.separator();
+                    ui.label(RichText::new("RECENTLY OPENED").size(10.0).color(muted()));
+                    let filter = self.repo_filter.to_lowercase();
+                    for path in self
+                        .recent_repos
+                        .clone()
+                        .into_iter()
+                        .filter(|path| path.to_string_lossy().to_lowercase().contains(&filter))
+                        .take(12)
+                    {
+                        let name = path
+                            .file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy();
+                        if ui.button(name).clicked() {
+                            self.queue(Job::Open(path));
+                            self.page = Page::History;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("View all repositories").clicked() {
+                        self.page = Page::Repositories;
+                        ui.close();
+                    }
+                });
             });
             ui.add_space(9.0);
             ui.separator();
             if let Some(branch) = &branch {
                 ui.vertical(|ui| {
                     ui.label(RichText::new("branch").size(10.0).color(muted()));
-                    ui.label(RichText::new(branch).size(13.0).color(accent()));
+                    ui.menu_button(branch, |ui| {
+                        ui.set_min_width(230.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.branch_filter)
+                                .hint_text("Search branches"),
+                        );
+                        ui.separator();
+                        let filter = self.branch_filter.to_lowercase();
+                        for candidate in local_branches
+                            .iter()
+                            .filter(|candidate| candidate.name.to_lowercase().contains(&filter))
+                        {
+                            if ui
+                                .selectable_label(candidate.current, &candidate.name)
+                                .clicked()
+                            {
+                                if !candidate.current {
+                                    self.request_branch_switch(candidate.name.clone(), false);
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
                 });
             }
             if let Some(count) = changed {
@@ -852,28 +1025,60 @@ impl GitVibe {
                     .color(if count == 0 { accent() } else { orange() }),
                 );
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let toolbar_width = 480.0;
+            ui.add_space(
+                (ui.max_rect().center().x - ui.cursor().left() - toolbar_width / 2.0).max(8.0),
+            );
+            ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.repo.is_some() && !self.busy, |ui| {
-                    if toolbar_action(ui, "Refresh") {
-                        self.queue(Job::Refresh);
+                    if toolbar_action(ui, "Fetch") {
+                        self.git(&["fetch", "--all", "--prune"]);
                     }
-                    if toolbar_action(ui, "Git console") {
-                        self.terminal_open = !self.terminal_open;
+                    if toolbar_action(
+                        ui,
+                        if self.pull_mode == PullMode::FetchAll {
+                            "Fetch"
+                        } else {
+                            "Pull"
+                        },
+                    ) {
+                        self.run_pull_mode();
                     }
-                    if toolbar_action(ui, "Stash") {
-                        self.page = Page::Stashes;
+                    ui.menu_button("v", |ui| {
+                        ui.label(
+                            RichText::new("Default pull action")
+                                .size(11.0)
+                                .color(muted()),
+                        );
+                        ui.separator();
+                        for mode in [
+                            PullMode::FetchAll,
+                            PullMode::Merge,
+                            PullMode::FastForwardOnly,
+                            PullMode::Rebase,
+                        ] {
+                            if ui
+                                .radio_value(&mut self.pull_mode, mode, mode.label())
+                                .clicked()
+                            {
+                                ui.close();
+                            }
+                        }
+                    });
+                    if toolbar_action(ui, "Push") {
+                        self.git(&["push"]);
                     }
                     if toolbar_action(ui, "Branch") {
                         self.page = Page::Branches;
                     }
-                    if toolbar_action(ui, "Push") {
-                        self.git(&["push"]);
+                    if toolbar_action(ui, "Stash") {
+                        self.page = Page::Stashes;
                     }
-                    if toolbar_action(ui, "Pull") {
-                        self.git(&["pull"]);
+                    if toolbar_action(ui, "Terminal") {
+                        self.terminal_open = !self.terminal_open;
                     }
-                    if toolbar_action(ui, "Fetch") {
-                        self.git(&["fetch", "--all", "--prune"]);
+                    if toolbar_action(ui, "Refresh") {
+                        self.queue(Job::Refresh);
                     }
                 });
                 if self.busy {
@@ -881,6 +1086,15 @@ impl GitVibe {
                 }
             });
         });
+    }
+
+    fn run_pull_mode(&mut self) {
+        match self.pull_mode {
+            PullMode::FetchAll => self.git(&["fetch", "--all", "--prune"]),
+            PullMode::Merge => self.git(&["pull", "--no-rebase"]),
+            PullMode::FastForwardOnly => self.git(&["pull", "--ff-only"]),
+            PullMode::Rebase => self.git(&["pull", "--rebase"]),
+        }
     }
 
     fn close_repository_tab(&mut self, path: &Path) {
@@ -929,7 +1143,10 @@ impl GitVibe {
                     label.push_str("...");
                 }
                 let selected = self.repo.as_deref() == Some(path.as_path())
-                    && !matches!(self.page, Page::Repositories | Page::Changelog);
+                    && !matches!(
+                        self.page,
+                        Page::Repositories | Page::Changelog | Page::NewTab
+                    );
                 let (opened, closed) = workspace_tab(
                     ui,
                     egui::Id::new(("repo_tab", path)),
@@ -987,21 +1204,37 @@ impl GitVibe {
                     self.page = Page::Changelog;
                 }
             }
-            ui.add_space(5.0);
-            ui.menu_button(RichText::new("+").size(15.0).color(text()), |ui| {
-                if ui.button("Open repository...").clicked() {
-                    if let Some(path) = pick_folder(self.repo.as_deref()) {
-                        self.queue(Job::Open(path));
-                        self.page = Page::History;
+            if self.new_tab_open {
+                let (opened, closed) = workspace_tab(
+                    ui,
+                    egui::Id::new("new_tab"),
+                    "New Tab",
+                    self.page == Page::NewTab,
+                    true,
+                    118.0,
+                );
+                if closed {
+                    self.new_tab_open = false;
+                    if self.page == Page::NewTab {
+                        self.page = if self.repo.is_some() {
+                            Page::History
+                        } else {
+                            Page::Repositories
+                        };
                     }
-                    ui.close();
+                } else if opened {
+                    self.page = Page::NewTab;
                 }
-                if ui.button("Open changelog").clicked() {
-                    self.changelog_open = true;
-                    self.page = Page::Changelog;
-                    ui.close();
-                }
-            });
+            }
+            ui.add_space(5.0);
+            if ui
+                .add(egui::Button::new(RichText::new("+").size(17.0).color(text())).frame(false))
+                .on_hover_text("New tab")
+                .clicked()
+            {
+                self.new_tab_open = true;
+                self.page = Page::NewTab;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.menu_button(
                     RichText::new(format!("Theme: {}", self.theme_choice.label()))
@@ -1035,7 +1268,36 @@ impl GitVibe {
         }
     }
 
+    fn request_branch_switch(&mut self, name: String, remote: bool) {
+        let (name, remote) = if remote {
+            let local = name.split_once('/').map(|(_, local)| local.to_owned());
+            if let Some(local) = local.filter(|local| {
+                self.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.branches.iter().any(|branch| &branch.name == local)
+                })
+            }) {
+                (local, false)
+            } else {
+                (name, true)
+            }
+        } else {
+            (name, false)
+        };
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| !snapshot.status.is_empty())
+        {
+            self.confirm_switch_branch = Some((name, remote));
+        } else {
+            self.queue(Job::SwitchBranch(name, false, remote));
+        }
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.style_mut().visuals.indent_has_left_vline = false;
+        ui.spacing_mut().indent = 10.0;
+        ui.spacing_mut().item_spacing.y = 2.0;
         let Some(snapshot) = self.snapshot.clone() else {
             ui.label(RichText::new("Opening repository...").color(muted()));
             return;
@@ -1097,16 +1359,7 @@ impl GitVibe {
         );
         ui.separator();
 
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("LOCAL").size(10.5).strong().color(text()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(local.len().to_string())
-                        .size(10.5)
-                        .color(accent()),
-                );
-            });
-        });
+        let local_count = local.len();
         let mut folders = std::collections::BTreeMap::<String, Vec<git::Ref>>::new();
         let mut direct = Vec::new();
         for branch in local {
@@ -1116,83 +1369,154 @@ impl GitVibe {
                 direct.push(branch);
             }
         }
-        for (folder, branches) in folders {
-            sidebar_folder(ui, &folder, 0.0);
-            for branch in branches {
-                let leaf = branch
-                    .name
-                    .strip_prefix(&format!("{folder}/"))
-                    .unwrap_or(&branch.name);
-                if sidebar_branch_row(ui, leaf, branch.current, 16.0) {
+        egui::CollapsingHeader::new(
+            RichText::new(format!("LOCAL   {local_count}"))
+                .size(10.5)
+                .strong()
+                .color(text()),
+        )
+        .id_salt("local_branches")
+        .default_open(true)
+        .show(ui, |ui| {
+            for (folder, branches) in folders {
+                egui::CollapsingHeader::new(RichText::new(&folder).size(11.5).color(muted()))
+                    .id_salt(("local_folder", &folder))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for branch in branches {
+                            let leaf = branch
+                                .name
+                                .strip_prefix(&format!("{folder}/"))
+                                .unwrap_or(&branch.name);
+                            let response = sidebar_branch_row(ui, leaf, branch.current, 0.0);
+                            if response.double_clicked() && !branch.current {
+                                self.request_branch_switch(branch.name.clone(), false);
+                            } else if response.clicked() {
+                                self.focus_ref(&branch.target);
+                            }
+                        }
+                    });
+            }
+            for branch in direct {
+                let response = sidebar_branch_row(ui, &branch.name, branch.current, 0.0);
+                if response.double_clicked() && !branch.current {
+                    self.request_branch_switch(branch.name.clone(), false);
+                } else if response.clicked() {
                     self.focus_ref(&branch.target);
                 }
             }
-        }
-        for branch in direct {
-            if sidebar_branch_row(ui, &branch.name, branch.current, 0.0) {
-                self.focus_ref(&branch.target);
-            }
-        }
-
-        ui.add_space(21.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("REMOTE").size(10.5).strong().color(text()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(remote.len().to_string())
-                        .size(10.5)
-                        .color(accent()),
-                );
-            });
         });
-        for remote_name in &snapshot.remotes {
-            sidebar_folder(ui, remote_name, 0.0);
-            let prefix = format!("{remote_name}/");
-            for branch in remote
-                .iter()
-                .filter(|branch| branch.name.starts_with(&prefix))
-            {
-                let leaf = branch.name.strip_prefix(&prefix).unwrap_or(&branch.name);
-                if sidebar_branch_row(ui, leaf, false, 16.0) {
-                    self.focus_ref(&branch.target);
-                }
-            }
-        }
 
-        ui.add_space(21.0);
+        ui.add_space(10.0);
         ui.separator();
-        ui.label(
+        egui::CollapsingHeader::new(
+            RichText::new(format!("REMOTE   {}", remote.len()))
+                .size(10.5)
+                .strong()
+                .color(text()),
+        )
+        .id_salt("remote_branches")
+        .default_open(true)
+        .show(ui, |ui| {
+            for remote_name in &snapshot.remotes {
+                egui::CollapsingHeader::new(RichText::new(remote_name).size(11.5).color(muted()))
+                    .id_salt(("remote_name", remote_name))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        let prefix = format!("{remote_name}/");
+                        let mut folders =
+                            std::collections::BTreeMap::<String, Vec<git::Ref>>::new();
+                        let mut direct = Vec::new();
+                        for branch in remote
+                            .iter()
+                            .filter(|branch| branch.name.starts_with(&prefix))
+                        {
+                            let rest = branch.name.strip_prefix(&prefix).unwrap_or(&branch.name);
+                            if let Some((folder, _)) = rest.split_once('/') {
+                                folders
+                                    .entry(folder.to_owned())
+                                    .or_default()
+                                    .push(branch.clone());
+                            } else {
+                                direct.push(branch.clone());
+                            }
+                        }
+                        for (folder, branches) in folders {
+                            egui::CollapsingHeader::new(
+                                RichText::new(&folder).size(11.5).color(muted()),
+                            )
+                            .id_salt(("remote_folder", remote_name, &folder))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for branch in branches {
+                                    let leaf = branch
+                                        .name
+                                        .strip_prefix(&format!("{prefix}{folder}/"))
+                                        .unwrap_or(&branch.name);
+                                    let response = sidebar_branch_row(ui, leaf, false, 0.0);
+                                    if response.double_clicked() {
+                                        self.request_branch_switch(branch.name.clone(), true);
+                                    } else if response.clicked() {
+                                        self.focus_ref(&branch.target);
+                                    }
+                                }
+                            });
+                        }
+                        for branch in direct {
+                            let leaf = branch.name.strip_prefix(&prefix).unwrap_or(&branch.name);
+                            let response = sidebar_branch_row(ui, leaf, false, 0.0);
+                            if response.double_clicked() {
+                                self.request_branch_switch(branch.name.clone(), true);
+                            } else if response.clicked() {
+                                self.focus_ref(&branch.target);
+                            }
+                        }
+                    });
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        egui::CollapsingHeader::new(
             RichText::new(format!("TAGS  {}", snapshot.tags.len()))
                 .size(10.5)
                 .strong()
                 .color(muted()),
-        );
-        for tag in snapshot.tags.iter().take(12) {
-            if (filter.is_empty() || tag.name.to_lowercase().contains(&filter))
-                && sidebar_branch_row(ui, &tag.name, false, 0.0)
-            {
-                self.focus_ref(&tag.target);
+        )
+        .default_open(false)
+        .show(ui, |ui| {
+            for tag in snapshot.tags.iter().take(20) {
+                if (filter.is_empty() || tag.name.to_lowercase().contains(&filter))
+                    && sidebar_branch_row(ui, &tag.name, false, 0.0).clicked()
+                {
+                    self.focus_ref(&tag.target);
+                }
             }
-        }
+        });
+    }
 
-        ui.add_space(20.0);
+    fn sidebar_footer(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         for (page, title) in [
             (Page::Branches, "Branches & tags"),
             (Page::Stashes, "Stashes"),
-            (Page::Console, "Git console"),
+            (Page::Console, "Terminal"),
             (Page::Updates, "Updates"),
         ] {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(title).size(11.5).color(muted()))
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::NONE)
-                        .min_size(egui::vec2(ui.available_width(), 22.0)),
-                )
-                .clicked()
-            {
+            let background = ui.painter().add(egui::Shape::Noop);
+            let response = ui.add(
+                egui::Button::new(RichText::new(title).size(11.5).color(muted()))
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::NONE)
+                    .min_size(egui::vec2(ui.available_width(), 22.0)),
+            );
+            if response.hovered() {
+                ui.painter().set(
+                    background,
+                    egui::Shape::rect_filled(response.rect, 3.0, elevated()),
+                );
+            }
+            if response.clicked() {
                 self.page = page;
             }
         }
@@ -1201,7 +1525,10 @@ impl GitVibe {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Viewing history").size(11.0).color(muted()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Clear").clicked() {
+                if ui
+                    .add_sized([58.0, 25.0], egui::Button::new("Clear"))
+                    .clicked()
+                {
                     self.search.clear();
                     self.search_active = false;
                     self.search_results.clear();
@@ -1209,14 +1536,15 @@ impl GitVibe {
                 if ui
                     .add_enabled(
                         !self.busy && !self.search.trim().is_empty(),
-                        egui::Button::new("Search"),
+                        egui::Button::new("Search").min_size(egui::vec2(66.0, 25.0)),
                     )
                     .clicked()
                 {
                     self.queue(Job::SearchHistory(self.search.clone()));
                 }
                 if ui
-                    .add(
+                    .add_sized(
+                        [250.0, 25.0],
                         egui::TextEdit::singleline(&mut self.search)
                             .hint_text("Search commits, authors or SHA")
                             .desired_width(250.0),
@@ -1314,6 +1642,7 @@ impl GitVibe {
                             self.select_commit(&commit.id);
                         }
                         response.context_menu(|ui| self.commit_context_menu(ui, commit));
+                        self.inline_branch_editor(ui, commit, response.rect);
                         response.on_hover_text(format!(
                             "{}\n{} | {} | {}",
                             commit.subject, commit.short, commit.author, commit.date
@@ -1401,6 +1730,7 @@ impl GitVibe {
                         self.select_commit(&commit.id);
                     }
                     response.context_menu(|ui| self.commit_context_menu(ui, commit));
+                    self.inline_branch_editor(ui, commit, response.rect);
                     response.on_hover_text(format!(
                         "{}\n{} | {} | {}",
                         commit.subject, commit.short, commit.author, commit.date
@@ -1421,6 +1751,7 @@ impl GitVibe {
 
     fn select_commit(&mut self, id: &str) {
         self.selected_commit = Some(id.to_owned());
+        self.selected_commit_file = None;
         self.selected_file = None;
         self.selected_file_staged = false;
         self.detail.clear();
@@ -1429,16 +1760,56 @@ impl GitVibe {
         self.queue(Job::InspectCommit(id.to_owned()));
     }
 
+    fn inline_branch_editor(&mut self, ui: &mut egui::Ui, commit: &git::Commit, row: egui::Rect) {
+        if self.inline_branch_at.as_deref() != Some(&commit.id) {
+            return;
+        }
+        let mut create = false;
+        let mut cancel = false;
+        egui::Area::new(egui::Id::new(("inline_branch", &commit.id)))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(row.left() + 5.0, row.top() - 2.0))
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(panel_alt())
+                    .stroke(Stroke::new(1.0, accent()))
+                    .inner_margin(egui::Margin::same(3))
+                    .show(ui, |ui| {
+                        let edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.branch_input)
+                                .hint_text("Enter branch name")
+                                .desired_width(132.0),
+                        );
+                        edit.request_focus();
+                        create = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                    });
+            });
+        if cancel {
+            self.inline_branch_at = None;
+        } else if create && !self.branch_input.trim().is_empty() {
+            self.git_owned(vec![
+                "branch".into(),
+                self.branch_input.trim().to_owned(),
+                commit.id.clone(),
+            ]);
+            self.inline_branch_at = None;
+        }
+    }
+
     fn commit_context_menu(&mut self, ui: &mut egui::Ui, commit: &git::Commit) {
         ui.set_min_width(245.0);
         let id = commit.id.clone();
         if ui.button("Show commit diff").clicked() {
             self.selected_commit = Some(id.clone());
+            self.selected_commit_file = None;
             self.page = Page::CommitDiff;
+            self.detail.clear();
             self.queue(Job::Inspect(vec![
                 "show".into(),
-                "--format=fuller".into(),
+                "--format=".into(),
                 "--patch".into(),
+                "--no-color".into(),
                 id.clone(),
             ]));
             ui.close();
@@ -1456,7 +1827,7 @@ impl GitVibe {
         }
         if ui.button("Create branch here...").clicked() {
             self.branch_input.clear();
-            self.create_ref_at = Some((RefAtKind::Branch, id.clone()));
+            self.inline_branch_at = Some(id.clone());
             ui.close();
         }
         if ui.button("Create tag here...").clicked() {
@@ -1517,20 +1888,101 @@ impl GitVibe {
             if ui.button("Back to graph").clicked() {
                 self.page = Page::History;
             }
-            if let Some(id) = &self.selected_commit {
+            if let Some(path) = &self.selected_commit_file {
+                ui.label(RichText::new(path).size(15.0).strong().color(text()));
+            }
+        });
+        if let Some(id) = &self.selected_commit {
+            let commit = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.commits.iter().find(|c| &c.id == id));
+            if let Some(commit) = commit {
+                ui.add_space(8.0);
                 ui.label(
-                    RichText::new(format!("Commit {}", &id[..id.len().min(12)]))
-                        .size(12.0)
+                    RichText::new(&commit.subject)
+                        .size(18.0)
                         .strong()
                         .color(text()),
                 );
+                ui.label(
+                    RichText::new(format!(
+                        "{}  ·  {}  ·  {}",
+                        commit.author, commit.date, commit.short
+                    ))
+                    .size(11.0)
+                    .color(muted()),
+                );
             }
-        });
+        }
+        ui.add_space(8.0);
         ui.separator();
         if self.detail.is_empty() {
             ui.label(RichText::new("Loading commit diff...").color(muted()));
         } else {
-            self.detail_view(ui);
+            let mut sections = Vec::<Vec<&str>>::new();
+            for line in self.detail.lines() {
+                if line.starts_with("diff --git ") {
+                    sections.push(Vec::new());
+                }
+                if let Some(section) = sections.last_mut() {
+                    section.push(line);
+                }
+            }
+            if sections.is_empty() {
+                ui.label(
+                    RichText::new(&self.detail)
+                        .monospace()
+                        .size(12.0)
+                        .color(muted()),
+                );
+                return;
+            }
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_min_width(820.0);
+                    for (index, section) in sections.into_iter().enumerate() {
+                        let path = section
+                            .iter()
+                            .find_map(|line| line.strip_prefix("+++ b/"))
+                            .or_else(|| section.iter().find_map(|line| line.strip_prefix("--- a/")))
+                            .unwrap_or("Changed file");
+                        let patch = section.join("\n");
+                        let hunks = git::diff_hunks(&patch);
+                        egui::CollapsingHeader::new(
+                            RichText::new(path).size(13.0).strong().color(text()),
+                        )
+                        .id_salt(("commit_patch", index, path))
+                        .default_open(index == 0 || self.selected_commit_file.is_some())
+                        .show(ui, |ui| {
+                            if hunks.is_empty() {
+                                for line in section.iter().skip(1) {
+                                    diff_line(ui, line);
+                                }
+                            }
+                            for hunk in hunks {
+                                ui.add_space(9.0);
+                                egui::Frame::new()
+                                    .fill(panel_alt())
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            RichText::new(&hunk.heading)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(violet()),
+                                        );
+                                    });
+                                let numbers = hunk.line_numbers();
+                                for (i, line) in hunk.lines.iter().enumerate() {
+                                    let (old, new) = numbers[i];
+                                    diff_line_numbered(ui, line, old, new, None);
+                                }
+                            }
+                        });
+                    }
+                });
         }
     }
 
@@ -1748,19 +2200,16 @@ impl GitVibe {
         };
         egui::Frame::new()
             .fill(if selected { elevated() } else { panel() })
-            .stroke(if selected {
-                Stroke::new(1.0, accent())
-            } else {
-                Stroke::NONE
-            })
-            .inner_margin(egui::Margin::symmetric(4, 2))
+            .inner_margin(egui::Margin::symmetric(6, 1))
             .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(status).size(9.0).strong().color(if staged {
-                        accent()
-                    } else {
-                        orange()
-                    }));
+                    ui.label(
+                        RichText::new(if status == "NEW" { "+" } else { "M" })
+                            .size(11.0)
+                            .strong()
+                            .color(if staged { accent() } else { orange() }),
+                    );
                     if ui
                         .add(
                             egui::Button::new(RichText::new(&file.path).size(12.0).color(text()))
@@ -1787,34 +2236,9 @@ impl GitVibe {
                             self.queue(Job::Inspect(args));
                         }
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if staged && action(ui, "Unstage", false) {
-                            if self.snapshot.as_ref().is_some_and(|s| s.commits.is_empty()) {
-                                self.git_owned(vec![
-                                    "rm".into(),
-                                    "--cached".into(),
-                                    "--".into(),
-                                    file.path.clone(),
-                                ]);
-                            } else {
-                                self.git_owned(vec![
-                                    "restore".into(),
-                                    "--staged".into(),
-                                    "--".into(),
-                                    file.path.clone(),
-                                ]);
-                            }
-                        }
-                        if !staged && action(ui, "Stage", false) {
-                            self.git_owned(vec!["add".into(), "--".into(), file.path.clone()]);
-                        }
-                        if !staged && file.index != '?' && action(ui, "Discard...", false) {
-                            self.confirm_discard = Some(file.path.clone());
-                        }
-                    });
                 });
             });
-        ui.add_space(4.0);
+        ui.add_space(1.0);
     }
 
     fn conflict_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus) {
@@ -2124,84 +2548,12 @@ impl GitVibe {
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {
-        section_title(
-            ui,
-            "POWER WHEN YOU NEED IT",
-            "Git console",
-            "Direct access to Git for the workflows without a dedicated view yet.",
-        );
-        ui.add_space(18.0);
-        egui::Frame::new()
-            .fill(panel_alt())
-            .corner_radius(egui::CornerRadius::same(10))
-            .stroke(Stroke::new(1.0, border()))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.label(RichText::new("COMMAND").size(10.0).strong().color(accent()));
-                ui.horizontal(|ui| {
-                    let edit = ui.add(
-                        egui::TextEdit::singleline(&mut self.command_input)
-                            .hint_text("git log --oneline -20")
-                            .desired_width(ui.available_width() - 90.0),
-                    );
-                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if action(ui, "Run", true) || enter {
-                        match git::split_command(&self.command_input) {
-                            Ok(args) => {
-                                self.git_owned(args);
-                                self.command_input.clear();
-                            }
-                            Err(error) => self.error = error,
-                        }
-                    }
-                });
-                ui.label(
-                    RichText::new("Arguments go straight to Git; no shell is involved.")
-                        .size(11.0)
-                        .color(muted()),
-                );
-            });
-        ui.add_space(20.0);
-        ui.label(
-            RichText::new("LAST OUTPUT")
-                .size(10.0)
-                .strong()
-                .color(muted()),
-        );
-        egui::Frame::new()
-            .fill(panel())
-            .corner_radius(egui::CornerRadius::same(10))
-            .stroke(Stroke::new(1.0, border()))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                egui::ScrollArea::both().show(ui, |ui| {
-                    if self.output.is_empty() {
-                        ui.label(
-                            RichText::new("Run a command to see its output here.").color(muted()),
-                        );
-                    } else {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(&self.output)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(text()),
-                            )
-                            .selectable(true),
-                        );
-                    }
-                });
-            });
+        self.console_dock(ui);
     }
 
     fn console_dock(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Git console")
-                    .size(11.0)
-                    .strong()
-                    .color(text()),
-            );
+            ui.label(RichText::new("Terminal").size(11.0).strong().color(text()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("×")
@@ -2210,6 +2562,9 @@ impl GitVibe {
                 {
                     self.terminal_open = false;
                 }
+                if ui.small_button("Clear").clicked() {
+                    self.terminal_output.clear();
+                }
             });
         });
         ui.separator();
@@ -2217,16 +2572,16 @@ impl GitVibe {
             .stick_to_bottom(true)
             .max_height((ui.available_height() - 35.0).max(50.0))
             .show(ui, |ui| {
-                if self.output.is_empty() {
+                if self.terminal_output.is_empty() {
                     ui.label(
-                        RichText::new("Run a Git command in this repository.")
+                        RichText::new("Run a shell command in this repository.")
                             .size(11.0)
                             .color(muted()),
                     );
                 } else {
                     ui.add(
                         egui::Label::new(
-                            RichText::new(&self.output)
+                            RichText::new(&self.terminal_output)
                                 .monospace()
                                 .size(11.0)
                                 .color(text()),
@@ -2236,23 +2591,84 @@ impl GitVibe {
                 }
             });
         ui.horizontal(|ui| {
-            ui.label(RichText::new("git").monospace().color(accent()));
+            let cwd = self.terminal_cwd.as_ref().or(self.repo.as_ref());
+            let prompt = cwd
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            ui.label(
+                RichText::new(if cfg!(windows) {
+                    format!("PS {prompt}>")
+                } else {
+                    format!("{prompt} $")
+                })
+                .monospace()
+                .size(11.0)
+                .color(accent()),
+            );
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.command_input)
-                    .hint_text("status --short")
+                    .hint_text("Enter a shell command")
                     .desired_width((ui.available_width() - 56.0).max(80.0)),
             );
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if ui.button("Run").clicked() || enter {
-                match git::split_command(&self.command_input) {
-                    Ok(args) => {
-                        self.git_owned(args);
-                        self.command_input.clear();
-                    }
-                    Err(error) => self.error = error,
+            if edit.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::ArrowUp))
+                && self.command_history_index > 0
+            {
+                self.command_history_index -= 1;
+                self.command_input = self.command_history[self.command_history_index].clone();
+            }
+            if edit.has_focus() && ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                if self.command_history_index + 1 < self.command_history.len() {
+                    self.command_history_index += 1;
+                    self.command_input = self.command_history[self.command_history_index].clone();
+                } else {
+                    self.command_history_index = self.command_history.len();
+                    self.command_input.clear();
                 }
             }
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if ui.button("Run").clicked() || enter {
+                self.run_terminal_input();
+            }
         });
+    }
+
+    fn run_terminal_input(&mut self) {
+        let command = self.command_input.trim().to_owned();
+        if command.is_empty() {
+            return;
+        }
+        let Some(cwd) = self.terminal_cwd.clone().or_else(|| self.repo.clone()) else {
+            return;
+        };
+        self.terminal_output
+            .push_str(&format!("{}> {command}\n", cwd.display()));
+        self.command_history.push(command.clone());
+        self.command_history_index = self.command_history.len();
+        self.command_input.clear();
+        if command.eq_ignore_ascii_case("clear") || command.eq_ignore_ascii_case("cls") {
+            self.terminal_output.clear();
+            return;
+        }
+        let change_directory = command
+            .strip_prefix("cd ")
+            .or_else(|| command.strip_prefix("Set-Location "));
+        if let Some(target) = change_directory {
+            let target = target.trim().trim_matches(['\'', '"']);
+            let path = PathBuf::from(target);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            };
+            if path.is_dir() {
+                self.terminal_cwd = Some(path.canonicalize().unwrap_or(path));
+            } else {
+                self.terminal_output.push_str("Directory does not exist.\n");
+            }
+            return;
+        }
+        self.queue(Job::Shell(command, cwd));
     }
 
     fn empty(&self, ui: &mut egui::Ui) {
@@ -2426,6 +2842,55 @@ impl GitVibe {
         });
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
+            if self.selected_file_staged {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Unstage file"))
+                    .clicked()
+                {
+                    if self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.commits.is_empty())
+                    {
+                        self.git_owned(vec![
+                            "rm".into(),
+                            "--cached".into(),
+                            "--".into(),
+                            path.clone(),
+                        ]);
+                    } else {
+                        self.git_owned(vec![
+                            "restore".into(),
+                            "--staged".into(),
+                            "--".into(),
+                            path.clone(),
+                        ]);
+                    }
+                    self.selected_file_staged = false;
+                }
+            } else {
+                if ui
+                    .add_enabled(!self.busy, egui::Button::new("Stage file"))
+                    .clicked()
+                {
+                    self.git_owned(vec!["add".into(), "--".into(), path.clone()]);
+                    self.selected_file_staged = true;
+                }
+                let tracked = self.snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .status
+                        .iter()
+                        .any(|file| file.path == path && file.index != '?')
+                });
+                if tracked
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Discard file..."))
+                        .clicked()
+                {
+                    self.confirm_discard = Some(path.clone());
+                }
+            }
+            ui.separator();
             if ui
                 .add_enabled(!self.busy, egui::Button::new("Diff view"))
                 .clicked()
@@ -2527,43 +2992,97 @@ impl GitVibe {
                 .or_else(|| self.search_results.iter().find(|c| &c.id == id))
                 .cloned();
             if let Some(commit) = commit {
+                let change_count = self
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.status.len());
+                if change_count > 0 {
+                    egui::Frame::new()
+                        .fill(elevated())
+                        .inner_margin(egui::Margin::symmetric(9, 6))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{change_count} file changes in working directory"
+                                    ))
+                                    .size(11.0)
+                                    .color(text()),
+                                );
+                                if ui.small_button("View changes").clicked() {
+                                    self.page = Page::Changes;
+                                }
+                            });
+                        });
+                    ui.add_space(7.0);
+                }
+                ui.label(
+                    RichText::new(format!("commit: {}", commit.short))
+                        .size(10.5)
+                        .monospace()
+                        .color(accent()),
+                );
+                ui.add_space(5.0);
                 egui::Frame::new()
-                    .fill(panel_alt())
-                    .inner_margin(egui::Margin::same(9))
+                    .fill(bg())
+                    .stroke(Stroke::new(1.0, border()))
+                    .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(format!("commit: {}", commit.short))
-                                .size(11.0)
-                                .monospace()
-                                .color(accent()),
-                        );
-                        ui.add_space(5.0);
-                        ui.label(
-                            RichText::new(&commit.subject)
-                                .size(14.0)
-                                .strong()
-                                .color(text()),
-                        );
-                        ui.label(
-                            RichText::new(format!("{}  |  {}", commit.author, commit.date))
-                                .size(11.0)
-                                .color(muted()),
-                        );
+                        ui.set_min_height(85.0);
+                        ui.label(RichText::new(&commit.subject).size(16.0).color(text()));
                         if self.compare_base.as_deref() == Some(&commit.id) {
                             ui.add_space(5.0);
                             badge(ui, "COMPARE BASE", orange());
                         }
                     });
+                ui.add_space(9.0);
+                ui.horizontal(|ui| {
+                    let initials = commit
+                        .author
+                        .split_whitespace()
+                        .filter_map(|part| part.chars().next())
+                        .take(2)
+                        .collect::<String>()
+                        .to_uppercase();
+                    egui::Frame::new()
+                        .fill(violet())
+                        .inner_margin(egui::Margin::same(7))
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(initials).size(12.0).strong().color(bg()));
+                        });
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&commit.author).size(12.0).color(text()));
+                        ui.label(
+                            RichText::new(format!("authored {}", commit.date))
+                                .size(10.5)
+                                .color(muted()),
+                        );
+                    });
+                    if let Some(parent) = commit.parents.first() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!(
+                                    "parent: {}",
+                                    &parent[..parent.len().min(7)]
+                                ))
+                                .size(10.0)
+                                .color(muted()),
+                            );
+                        });
+                    }
+                });
                 ui.add_space(8.0);
                 ui.add_enabled_ui(!self.busy, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         if action(ui, "Show patch", false) {
+                            self.selected_commit_file = None;
                             self.page = Page::CommitDiff;
+                            self.detail.clear();
                             self.queue(Job::Inspect(vec![
                                 "show".into(),
-                                "--format=fuller".into(),
+                                "--format=".into(),
                                 "--patch".into(),
-                                "--stat".into(),
+                                "--no-color".into(),
                                 commit.id.clone(),
                             ]));
                         }
@@ -2613,6 +3132,10 @@ impl GitVibe {
                             self.reset_mode = ResetMode::Mixed;
                             self.reset_confirmation.clear();
                         }
+                        if action(ui, "New branch...", false) {
+                            self.branch_input.clear();
+                            self.create_ref_at = Some((RefAtKind::Branch, commit.id.clone()));
+                        }
                     });
                 });
                 if self.commit_files_id.as_deref() == Some(&commit.id) {
@@ -2626,38 +3149,53 @@ impl GitVibe {
                     ui.add_space(5.0);
                     let files = self.commit_files.clone();
                     for file in files {
-                        ui.horizontal(|ui| {
-                            let status_color = match file.status.as_str() {
-                                "A" => accent(),
-                                "D" => red(),
-                                _ => orange(),
-                            };
-                            ui.label(
-                                RichText::new(&file.status)
-                                    .monospace()
-                                    .strong()
-                                    .color(status_color),
-                            );
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        RichText::new(&file.path).size(11.0).color(text()),
-                                    )
-                                    .fill(Color32::TRANSPARENT)
-                                    .stroke(Stroke::NONE),
-                                )
-                                .clicked()
-                            {
-                                self.queue(Job::Inspect(vec![
-                                    "show".into(),
-                                    "--format=fuller".into(),
-                                    "--patch".into(),
-                                    commit.id.clone(),
-                                    "--".into(),
-                                    file.path.clone(),
-                                ]));
-                            }
-                        });
+                        let selected = self.selected_commit_file.as_deref() == Some(&file.path);
+                        egui::Frame::new()
+                            .fill(if selected {
+                                elevated()
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    let status_color = match file.status.as_str() {
+                                        "A" => accent(),
+                                        "D" => red(),
+                                        _ => orange(),
+                                    };
+                                    ui.label(
+                                        RichText::new(&file.status)
+                                            .monospace()
+                                            .strong()
+                                            .color(status_color),
+                                    );
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new(&file.path).size(11.0).color(text()),
+                                            )
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(Stroke::NONE),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_commit_file = Some(file.path.clone());
+                                        self.page = Page::CommitDiff;
+                                        self.detail.clear();
+                                        self.queue(Job::Inspect(vec![
+                                            "show".into(),
+                                            "--format=".into(),
+                                            "--patch".into(),
+                                            "--no-color".into(),
+                                            commit.id.clone(),
+                                            "--".into(),
+                                            file.path.clone(),
+                                        ]));
+                                    }
+                                });
+                            });
                     }
                 }
             }
@@ -2845,6 +3383,7 @@ impl GitVibe {
                             .corner_radius(egui::CornerRadius::same(7))
                             .inner_margin(egui::Margin::symmetric(8, 5))
                             .show(ui, |ui| {
+                                ui.set_min_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         RichText::new(&hunk.heading)
@@ -2852,23 +3391,30 @@ impl GitVibe {
                                             .size(10.5)
                                             .color(violet()),
                                     );
-                                    if ui
-                                        .add_enabled(
-                                            !self.busy,
-                                            egui::Button::new(if self.selected_file_staged {
-                                                "Unstage hunk"
-                                            } else {
-                                                "Stage hunk"
-                                            }),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.hunk_action = true;
-                                        self.queue(Job::ApplyHunk(
-                                            hunk.patch.clone(),
-                                            self.selected_file_staged,
-                                        ));
-                                    }
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.busy,
+                                                    egui::Button::new(
+                                                        if self.selected_file_staged {
+                                                            "Unstage hunk"
+                                                        } else {
+                                                            "Stage hunk"
+                                                        },
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.hunk_action = true;
+                                                self.queue(Job::ApplyHunk(
+                                                    hunk.patch.clone(),
+                                                    self.selected_file_staged,
+                                                ));
+                                            }
+                                        },
+                                    );
                                 });
                             });
                         let numbers = hunk.line_numbers();
@@ -2887,25 +3433,32 @@ impl GitVibe {
                             } else {
                                 None
                             };
+                            let row_y = ui.cursor().top();
+                            let row_hovered = ui.ctx().pointer_hover_pos().is_some_and(|pointer| {
+                                pointer.y >= row_y && pointer.y < row_y + 24.0
+                            });
                             ui.horizontal(|ui| {
                                 if let Some(patch) = hunk.line_patch(index) {
-                                    if ui
-                                        .add_enabled(
-                                            !self.busy,
-                                            egui::Button::new(if self.selected_file_staged {
-                                                "Unstage"
-                                            } else {
-                                                "Stage"
-                                            })
-                                            .small(),
-                                        )
-                                        .clicked()
+                                    if row_hovered
+                                        && ui
+                                            .add_enabled(
+                                                !self.busy,
+                                                egui::Button::new(if self.selected_file_staged {
+                                                    "Unstage"
+                                                } else {
+                                                    "Stage"
+                                                })
+                                                .small(),
+                                            )
+                                            .clicked()
                                     {
                                         self.hunk_action = true;
                                         self.queue(Job::ApplyLine(
                                             patch,
                                             self.selected_file_staged,
                                         ));
+                                    } else if !row_hovered {
+                                        ui.add_space(51.0);
                                     }
                                 } else {
                                     ui.add_space(51.0);
@@ -2958,12 +3511,18 @@ impl GitVibe {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Forget").clicked() {
+                        if ui
+                            .add_sized([62.0, 27.0], egui::Button::new("Forget"))
+                            .clicked()
+                        {
                             self.recent_repos.retain(|p| p != &path);
                             self.pinned_repos.retain(|p| p != &path);
                         }
                         if ui
-                            .small_button(if pinned { "Unpin" } else { "Pin" })
+                            .add_sized(
+                                [56.0, 27.0],
+                                egui::Button::new(if pinned { "Unpin" } else { "Pin" }),
+                            )
                             .clicked()
                         {
                             if pinned {
@@ -2974,13 +3533,19 @@ impl GitVibe {
                         }
                         if open
                             && ui
-                                .add_enabled(!self.busy, egui::Button::new("Close tab").small())
+                                .add_enabled(
+                                    !self.busy,
+                                    egui::Button::new("Close tab").min_size(egui::vec2(77.0, 27.0)),
+                                )
                                 .clicked()
                         {
                             self.close_repository_tab(&path);
                         }
                         if ui
-                            .add_enabled(exists && !self.busy, egui::Button::new("Open"))
+                            .add_enabled(
+                                exists && !self.busy,
+                                egui::Button::new("Open").min_size(egui::vec2(58.0, 27.0)),
+                            )
                             .clicked()
                         {
                             if self.repo.as_ref() != Some(&path) {
@@ -3081,6 +3646,76 @@ impl GitVibe {
                     self.pinned_repos.retain(|path| path.exists());
                 }
             });
+    }
+
+    fn new_tab(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(26.0);
+        ui.horizontal(|ui| {
+            ui.add_space(48.0);
+            let left_width = (ui.available_width() * 0.57).max(340.0);
+            ui.vertical(|ui| {
+                ui.set_width(left_width);
+                ui.label(RichText::new("Repositories").size(22.0).color(text()));
+                ui.add_space(16.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Open").clicked()
+                        && let Some(path) = pick_folder(self.repo.as_deref())
+                    {
+                        self.queue(Job::Open(path));
+                        self.page = Page::History;
+                    }
+                    if ui.button("Clone").clicked() {
+                        self.show_clone = true;
+                    }
+                    if ui.button("Create").clicked() {
+                        self.page = Page::Repositories;
+                    }
+                });
+                ui.add_space(22.0);
+                ui.label(RichText::new("Recent").size(12.0).color(muted()));
+                ui.add_space(5.0);
+                for path in self.recent_repos.clone().into_iter().take(12) {
+                    let name = path
+                        .file_name()
+                        .unwrap_or(path.as_os_str())
+                        .to_string_lossy();
+                    ui.horizontal(|ui| {
+                        if ui.link(name).clicked() {
+                            self.queue(Job::Open(path.clone()));
+                            self.page = Page::History;
+                        }
+                        ui.label(
+                            RichText::new(path.display().to_string())
+                                .size(11.0)
+                                .color(muted()),
+                        );
+                    });
+                }
+            });
+            ui.separator();
+            ui.add_space(18.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Get started").size(20.0).color(text()));
+                ui.add_space(14.0);
+                ui.label(
+                    RichText::new(
+                        "Open an existing repository, clone from a remote, or create one locally.",
+                    )
+                    .size(12.0)
+                    .color(muted()),
+                );
+                ui.add_space(22.0);
+                ui.label(RichText::new("Resources").size(12.0).color(text()));
+                if ui.link("Release notes").clicked() {
+                    self.changelog_open = true;
+                    self.page = Page::Changelog;
+                }
+                ui.hyperlink_to(
+                    "Documentation",
+                    "https://github.com/boubou666/GitVibe#readme",
+                );
+            });
+        });
     }
 
     fn changelog(&mut self, ui: &mut egui::Ui) {
@@ -3217,6 +3852,28 @@ impl GitVibe {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.conflict_dialog(ctx);
+        if let Some((name, remote)) = self.confirm_switch_branch.clone() {
+            egui::Window::new("Switch branch with local changes")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(format!("Switch to {name}?"));
+                    ui.label("Git will refuse the switch if your changes would be overwritten.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_switch_branch = None;
+                        }
+                        if ui.button("Keep changes and switch").clicked() {
+                            self.queue(Job::SwitchBranch(name.clone(), false, remote));
+                            self.confirm_switch_branch = None;
+                        }
+                        if ui.button("Stash changes and switch").clicked() {
+                            self.queue(Job::SwitchBranch(name.clone(), true, remote));
+                            self.confirm_switch_branch = None;
+                        }
+                    });
+                });
+        }
         if let Some(id) = self.confirm_checkout_commit.clone() {
             egui::Window::new("Checkout commit?")
                 .collapsible(false)
@@ -3282,43 +3939,100 @@ impl GitVibe {
         }
         if self.show_clone {
             let mut open = true;
-            egui::Window::new("Clone repository")
+            egui::Window::new("Clone a Repository")
                 .open(&mut open)
                 .collapsible(false)
-                .resizable(false)
+                .resizable(true)
+                .default_width(880.0)
+                .default_height(500.0)
                 .show(ctx, |ui| {
-                    ui.label("Repository URL or local path");
-                    ui.add(egui::TextEdit::singleline(&mut self.clone_url).desired_width(450.0));
-                    ui.label("Destination folder");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.clone_destination)
-                            .desired_width(450.0),
-                    );
-                    if action(ui, "Choose parent folder...", false)
-                        && let Some(parent) = pick_folder(
-                            Path::new(&self.clone_destination)
-                                .parent()
-                                .filter(|path| path.is_dir()),
-                        )
-                    {
-                        let name = git::default_clone_directory(&self.clone_url)
-                            .unwrap_or_else(|| "repository".to_owned());
-                        self.clone_destination = parent.join(name).to_string_lossy().into_owned();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.clone_url.trim().is_empty()
-                                && !self.clone_destination.trim().is_empty(),
-                            egui::Button::new("Clone"),
-                        )
-                        .clicked()
-                    {
-                        self.queue(Job::Clone(
-                            self.clone_url.trim().to_owned(),
-                            PathBuf::from(self.clone_destination.trim()),
-                        ));
-                        self.show_clone = false;
-                    }
+                    const SOURCES: [(&str, &str); 8] = [
+                        ("Clone with URL", "https://example.com/owner/repository.git"),
+                        ("GitHub.com", "https://github.com/owner/repository.git"),
+                        ("GitHub Enterprise", "https://github.example.com/owner/repository.git"),
+                        ("GitLab.com", "https://gitlab.com/owner/repository.git"),
+                        ("GitLab Self-Managed", "https://gitlab.example.com/owner/repository.git"),
+                        ("Bitbucket.org", "https://bitbucket.org/owner/repository.git"),
+                        ("Bitbucket Server", "https://bitbucket.example.com/scm/project/repository.git"),
+                        ("Azure DevOps", "https://dev.azure.com/organization/project/_git/repository"),
+                    ];
+                    ui.set_min_size(egui::vec2(850.0, 470.0));
+                    ui.horizontal_top(|ui| {
+                        egui::Frame::new().fill(panel_alt()).inner_margin(10.0).show(ui, |ui| {
+                            ui.set_width(205.0);
+                            for (index, (label, _)) in SOURCES.iter().enumerate() {
+                                if ui.selectable_label(self.clone_source == index, *label).clicked() {
+                                    self.clone_source = index;
+                                }
+                            }
+                        });
+                        ui.add_space(10.0);
+                        ui.vertical(|ui| {
+                            ui.set_min_width(600.0);
+                            ui.heading("Clone a Repo");
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                ui.add_sized([135.0, 26.0], egui::Label::new("Where to clone to"));
+                                ui.add_sized(
+                                    [405.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.clone_destination)
+                                        .hint_text("Destination folder"),
+                                );
+                                if ui.button("Browse").clicked()
+                                    && let Some(parent) = pick_folder(
+                                        Path::new(&self.clone_destination)
+                                            .parent()
+                                            .filter(|path| path.is_dir()),
+                                    )
+                                {
+                                    let name = git::default_clone_directory(&self.clone_url)
+                                        .unwrap_or_else(|| "repository".to_owned());
+                                    self.clone_destination = parent.join(name).to_string_lossy().into_owned();
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.add_sized([135.0, 26.0], egui::Label::new("URL or local path"));
+                                ui.add_sized(
+                                    [490.0, 26.0],
+                                    egui::TextEdit::singleline(&mut self.clone_url)
+                                        .hint_text(SOURCES[self.clone_source].1),
+                                );
+                            });
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(135.0);
+                                ui.checkbox(&mut self.clone_shallow, "Shallow clone")
+                                    .on_hover_text("Download only the latest commit (--depth=1)");
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(135.0);
+                                ui.checkbox(&mut self.clone_sparse, "Sparse checkout")
+                                    .on_hover_text("Start with only root files checked out (--sparse)");
+                            });
+                            ui.add_space(8.0);
+                            ui.label(RichText::new("Git uses your existing credentials and credential helper for private repositories.").color(muted()).small());
+                            ui.add_space(18.0);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(
+                                        !self.clone_url.trim().is_empty()
+                                            && !self.clone_destination.trim().is_empty(),
+                                        egui::Button::new("Clone the repo!").fill(elevated()),
+                                    )
+                                    .clicked()
+                                {
+                                    self.queue(Job::Clone(
+                                        self.clone_url.trim().to_owned(),
+                                        PathBuf::from(self.clone_destination.trim()),
+                                        self.clone_shallow,
+                                        self.clone_sparse,
+                                    ));
+                                    self.show_clone = false;
+                                }
+                            });
+                        });
+                    });
                 });
             self.show_clone &= open;
         }
@@ -3517,6 +4231,7 @@ impl eframe::App for GitVibe {
         eframe::set_value(storage, "last_active_repo", &self.last_active_repo);
         eframe::set_value(storage, "changelog_open", &self.changelog_open);
         eframe::set_value(storage, "theme_choice", &self.theme_choice);
+        eframe::set_value(storage, "pull_mode", &self.pull_mode);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -3540,7 +4255,10 @@ impl eframe::App for GitVibe {
                     .inner_margin(egui::Margin::symmetric(8, 3)),
             )
             .show(ui, |ui| self.workspace_tabs(ui));
-        let repository_view = !matches!(self.page, Page::Repositories | Page::Changelog);
+        let repository_view = !matches!(
+            self.page,
+            Page::Repositories | Page::Changelog | Page::NewTab
+        );
         if repository_view {
             egui::Panel::top("top")
                 .frame(
@@ -3581,10 +4299,10 @@ impl eframe::App for GitVibe {
                 });
             });
         if repository_view {
-            egui::Panel::left("nav_compact")
+            egui::Panel::left("nav_compact_v3")
                 .resizable(true)
-                .default_size(208.0)
-                .min_size(170.0)
+                .default_size(162.0)
+                .min_size(155.0)
                 .frame(
                     egui::Frame::new()
                         .fill(panel())
@@ -3592,9 +4310,12 @@ impl eframe::App for GitVibe {
                         .inner_margin(egui::Margin::same(8)),
                 )
                 .show(ui, |ui| {
+                    let body_height = (ui.available_height() - 126.0).max(100.0);
                     egui::ScrollArea::vertical()
+                        .max_height(body_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| self.sidebar(ui));
+                    self.sidebar_footer(ui);
                 });
         }
         if repository_view {
@@ -3645,6 +4366,7 @@ impl eframe::App for GitVibe {
                 Page::History => self.history(ui),
                 Page::Changes => self.change_diff_view(ui),
                 Page::CommitDiff => self.commit_diff_view(ui),
+                Page::NewTab => self.new_tab(ui),
                 Page::Repositories => self.repositories(ui),
                 Page::Changelog => self.changelog(ui),
                 Page::Branches => self.branches(ui),
@@ -3667,6 +4389,38 @@ fn pick_folder(start: Option<&Path>) -> Option<PathBuf> {
         dialog = dialog.set_directory(path);
     }
     dialog.pick_folder()
+}
+
+fn run_shell_command(cwd: &Path, script: &str) -> Result<String, String> {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]);
+        command
+    } else {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+        let mut command = Command::new(shell);
+        command.args(["-lc", script]);
+        command
+    };
+    command.current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().map_err(|error| error.to_string())?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        combined.push_str(&format!("\nExited with {}\n", output.status));
+    }
+    Ok(combined)
 }
 
 fn diff_line(ui: &mut egui::Ui, line: &str) {
@@ -3716,68 +4470,31 @@ fn diff_line_numbered(
         .fill(tint)
         .inner_margin(egui::Margin::symmetric(3, 1))
         .show(ui, |ui| {
-            ui.add_sized(
-                [33.0, 16.0],
-                egui::Label::new(
-                    RichText::new(old.map_or(String::new(), |n| n.to_string()))
-                        .monospace()
-                        .size(10.0)
-                        .color(muted()),
-                ),
-            );
-            ui.add_sized(
-                [33.0, 16.0],
-                egui::Label::new(
-                    RichText::new(new.map_or(String::new(), |n| n.to_string()))
-                        .monospace()
-                        .size(10.0)
-                        .color(muted()),
-                ),
-            );
-            let mut job = egui::text::LayoutJob::default();
-            let content = line.strip_prefix(['+', '-', ' ']).unwrap_or(line);
-            job.append(
-                &line[..line.len() - content.len()],
-                0.0,
-                egui::TextFormat {
-                    font_id: egui::FontId::monospace(11.0),
-                    color,
-                    ..Default::default()
-                },
-            );
-            if let Some(other) = other {
-                let other = other.strip_prefix(['+', '-']).unwrap_or(other);
-                let a: Vec<char> = content.chars().collect();
-                let b: Vec<char> = other.chars().collect();
-                let prefix = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
-                let suffix = a[prefix..]
-                    .iter()
-                    .rev()
-                    .zip(b[prefix..].iter().rev())
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                let start = a[..prefix].iter().collect::<String>();
-                let middle = a[prefix..a.len() - suffix].iter().collect::<String>();
-                let end = a[a.len() - suffix..].iter().collect::<String>();
-                for (part, highlight) in [(start, false), (middle, true), (end, false)] {
-                    job.append(
-                        &part,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::monospace(11.0),
-                            color,
-                            background: if highlight {
-                                elevated()
-                            } else {
-                                Color32::TRANSPARENT
-                            },
-                            ..Default::default()
-                        },
-                    );
-                }
-            } else {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.add_sized(
+                    [33.0, 16.0],
+                    egui::Label::new(
+                        RichText::new(old.map_or(String::new(), |n| n.to_string()))
+                            .monospace()
+                            .size(10.0)
+                            .color(muted()),
+                    ),
+                );
+                ui.add_sized(
+                    [33.0, 16.0],
+                    egui::Label::new(
+                        RichText::new(new.map_or(String::new(), |n| n.to_string()))
+                            .monospace()
+                            .size(10.0)
+                            .color(muted()),
+                    ),
+                );
+                let mut job = egui::text::LayoutJob::default();
+                let content = line.strip_prefix(['+', '-', ' ']).unwrap_or(line);
                 job.append(
-                    content,
+                    &line[..line.len() - content.len()],
                     0.0,
                     egui::TextFormat {
                         font_id: egui::FontId::monospace(11.0),
@@ -3785,9 +4502,135 @@ fn diff_line_numbered(
                         ..Default::default()
                     },
                 );
-            }
-            ui.add(egui::Label::new(job).selectable(true));
+                if let Some(other) = other {
+                    let other = other.strip_prefix(['+', '-']).unwrap_or(other);
+                    let a: Vec<char> = content.chars().collect();
+                    let b: Vec<char> = other.chars().collect();
+                    let prefix = a.iter().zip(&b).take_while(|(a, b)| a == b).count();
+                    let suffix = a[prefix..]
+                        .iter()
+                        .rev()
+                        .zip(b[prefix..].iter().rev())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    let start = a[..prefix].iter().collect::<String>();
+                    let middle = a[prefix..a.len() - suffix].iter().collect::<String>();
+                    let end = a[a.len() - suffix..].iter().collect::<String>();
+                    for (part, highlight) in [(start, false), (middle, true), (end, false)] {
+                        append_code_highlight(
+                            &mut job,
+                            &part,
+                            color,
+                            if highlight {
+                                elevated()
+                            } else {
+                                Color32::TRANSPARENT
+                            },
+                        );
+                    }
+                } else {
+                    append_code_highlight(&mut job, content, color, Color32::TRANSPARENT);
+                }
+                ui.add(egui::Label::new(job).selectable(true));
+            });
         });
+}
+
+fn append_code_highlight(
+    job: &mut egui::text::LayoutJob,
+    content: &str,
+    base: Color32,
+    background: Color32,
+) {
+    let chars = content.chars().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < chars.len() {
+        let start = i;
+        let syntax_color = if chars[i] == '"' || chars[i] == '\'' {
+            let quote = chars[i];
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    i = (i + 2).min(chars.len());
+                    continue;
+                }
+                i += 1;
+                if chars[i - 1] == quote {
+                    break;
+                }
+            }
+            orange()
+        } else if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+            i = chars.len();
+            muted()
+        } else if chars[i].is_ascii_alphanumeric() || chars[i] == '_' {
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let token = chars[start..i].iter().collect::<String>();
+            if matches!(
+                token.as_str(),
+                "fn" | "let"
+                    | "mut"
+                    | "pub"
+                    | "struct"
+                    | "enum"
+                    | "impl"
+                    | "use"
+                    | "mod"
+                    | "match"
+                    | "if"
+                    | "else"
+                    | "for"
+                    | "while"
+                    | "return"
+                    | "const"
+                    | "static"
+                    | "async"
+                    | "await"
+                    | "class"
+                    | "def"
+                    | "function"
+                    | "import"
+                    | "from"
+                    | "export"
+                    | "new"
+                    | "var"
+                    | "interface"
+                    | "type"
+            ) {
+                blue()
+            } else if token
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+            {
+                orange()
+            } else if token
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_uppercase())
+            {
+                violet()
+            } else {
+                base
+            }
+        } else {
+            i += 1;
+            base
+        };
+        let token = chars[start..i].iter().collect::<String>();
+        job.append(
+            &token,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::monospace(11.0),
+                color: syntax_color,
+                background,
+                ..Default::default()
+            },
+        );
+    }
 }
 
 struct CommitRowStyle {
@@ -3877,11 +4720,26 @@ fn paint_commit_row(
             );
         }
     }
-    painter.circle_filled(egui::pos2(node_x, mid_y), 6.4, bg());
-    painter.circle_filled(
-        egui::pos2(node_x, mid_y),
-        if commit.parents.len() > 1 { 5.6 } else { 4.6 },
-        lane_color(commit.lane),
+    let avatar_colors = [accent(), violet(), orange(), blue(), red()];
+    let author_hash = commit.author.bytes().fold(0usize, |acc, byte| {
+        acc.wrapping_mul(31).wrapping_add(byte as usize)
+    });
+    let node = egui::pos2(node_x, mid_y);
+    painter.circle_filled(node, 9.4, lane_color(commit.lane));
+    painter.circle_filled(node, 7.6, avatar_colors[author_hash % avatar_colors.len()]);
+    let initials = commit
+        .author
+        .split_whitespace()
+        .filter_map(|part| part.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    painter.text(
+        node,
+        egui::Align2::CENTER_CENTER,
+        initials,
+        egui::FontId::proportional(7.5),
+        bg(),
     );
 
     let names = refs
@@ -3922,7 +4780,7 @@ fn paint_commit_row(
         ],
         Stroke::new(1.0, border()),
     );
-    let available = (rect.width() - graph_width - 125.0).max(30.0);
+    let available = (rect.width() - graph_width - 215.0).max(30.0);
     let max_chars = (available / 6.6).floor() as usize;
     let mut subject = commit.subject.chars().take(max_chars).collect::<String>();
     if commit.subject.chars().count() > max_chars {
@@ -3938,7 +4796,7 @@ fn paint_commit_row(
     painter.text(
         egui::pos2(rect.right() - 8.0, mid_y),
         egui::Align2::RIGHT_CENTER,
-        &commit.date,
+        format!("{} · {}", commit.author, commit.date),
         egui::FontId::proportional(10.5),
         muted(),
     );
@@ -4008,28 +4866,12 @@ fn workspace_tab(
     (response.clicked() && !close_clicked, close_clicked)
 }
 
-fn sidebar_folder(ui: &mut egui::Ui, label: &str, depth: f32) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(ui.available_width(), 22.0), egui::Sense::hover());
-    let x = rect.left() + 14.0 + depth;
-    let icon =
-        egui::Rect::from_min_size(egui::pos2(x, rect.center().y - 4.0), egui::vec2(10.0, 8.0));
-    ui.painter().rect_stroke(
-        icon,
-        1.0,
-        Stroke::new(1.0, muted()),
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().text(
-        egui::pos2(x + 16.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        label,
-        egui::FontId::proportional(11.5),
-        muted(),
-    );
-}
-
-fn sidebar_branch_row(ui: &mut egui::Ui, label: &str, selected: bool, depth: f32) -> bool {
+fn sidebar_branch_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    selected: bool,
+    depth: f32,
+) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), egui::Sense::click());
     if selected {
@@ -4083,23 +4925,36 @@ fn sidebar_branch_row(ui: &mut egui::Ui, label: &str, selected: bool, depth: f32
         ],
         Stroke::new(1.0, if selected { text() } else { muted() }),
     );
+    let max_chars = ((rect.width() - depth - 32.0) / 6.1).floor().max(5.0) as usize;
+    let mut display = label.chars().take(max_chars).collect::<String>();
+    if label.chars().count() > max_chars {
+        display.truncate(display.len().saturating_sub(3));
+        display.push_str("...");
+    }
     ui.painter().text(
         egui::pos2(x + 13.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        label,
+        display,
         egui::FontId::proportional(11.5),
         if selected { text() } else { muted() },
     );
-    response.clicked()
+    response
 }
 
 fn toolbar_action(ui: &mut egui::Ui, label: &str) -> bool {
-    ui.add(
+    let background = ui.painter().add(egui::Shape::Noop);
+    let response = ui.add(
         egui::Button::new(RichText::new(label).size(11.5).color(text()))
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::NONE),
-    )
-    .clicked()
+    );
+    if response.hovered() {
+        ui.painter().set(
+            background,
+            egui::Shape::rect_filled(response.rect, 3.0, elevated()),
+        );
+    }
+    response.clicked()
 }
 
 fn action(ui: &mut egui::Ui, label: &str, prominent: bool) -> bool {

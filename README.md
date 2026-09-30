@@ -4,7 +4,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 
 ## Current features
 
-- Open, initialize, and clone repositories, including local and authenticated remote URLs.
+- Open, initialize, and clone repositories, including local and authenticated remote URLs. Cloning supports shallow history and sparse checkout.
 - Keep multiple repositories open in tabs, pin favorites, search recent repositories, and restore window placement. The Changelog tab can be closed and reopened from the `+` menu.
 - Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
@@ -18,10 +18,10 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Delete merged local branches and local tags with confirmation; reset HEAD using soft, mixed, or hard mode.
 - Fetch, pull, and push using your normal Git credential helper.
 - Create, inspect, apply, and pop stashes.
-- Run any Git command from a docked Git console while keeping the graph in view. This is an argument parser, not a shell.
+- Run PowerShell commands on Windows or shell commands on Linux and macOS from a docked terminal with command history and working directory navigation.
 - Drag a repository folder onto the window to open it.
 
-The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The console provides Git features without a dedicated screen yet, such as rebase, bisect, submodules, and worktrees. Commands needing a terminal editor or interactive stdin are not supported in the console yet.
+The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts.
 
 ## Download and run
 
@@ -58,7 +58,7 @@ The integration tests exercise Git repository initialization, status, staging, c
 
 ## How it works
 
-The app invokes Git directly with argument arrays. It does not pass text through PowerShell, `cmd`, or another shell. Remote operations use your existing Git configuration, SSH keys, and credential helper. Read and write commands run on a worker thread so the window stays responsive.
+The app invokes Git operations directly with argument arrays. Only commands entered into the terminal dock are passed to PowerShell or your POSIX shell. Remote operations use your existing Git configuration, SSH keys, and credential helper. Read and write commands run on a worker thread so the window stays responsive.
 
 Discarding working tree changes asks for confirmation. Hard reset also requires typing `RESET`. Local branch deletion uses Git's safe `-d` mode, which refuses to delete unmerged work. The Git console can execute destructive Git commands, so review commands before running them.
 
