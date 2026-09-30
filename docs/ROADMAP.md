@@ -72,19 +72,25 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 4. Add the new GitVibe ribbon icon to the window, Windows executable and installer, macOS bundle, and Linux desktop package. Use a dark Windows installer and prevent a console window during Windows launches and Git commands.
 5. Record application errors and panic backtraces in a rotating local log, with a direct way to open its folder from the Updates screen.
 
+## Completed in 0.18.0
+
+1. Open the selected working-tree file in its default external editor, while checking that the resolved file remains inside the repository.
+2. Give Git operations visible, consistently sized toolbar buttons and drawn icons; join Pull and its options arrow into a segmented control.
+3. Separate the current-branch checkmark from the branch icon and draw the merge-target indicator directly so it renders without a special font glyph.
+
 ## Next: GitKraken workflow parity
 
 1. **Broader undo and redo.** Extend explicit recovery data beyond staging and ordinary unpublished commits to other safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
 2. **Accessibility.** Continue reviewing focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
 3. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
-4. **More GitKraken workflows.** Add external file editing, amend controls, and direct commit context actions for rewording and dropping commits. Add a clear push-after-commit option. GitKraken describes these in its [file editing](https://help.gitkraken.com/gitkraken-desktop/editing-files/) and [commit](https://help.gitkraken.com/gitkraken-desktop/commits/) guides.
+4. **More GitKraken workflows.** Add amend controls and direct commit context actions for rewording and dropping commits. Add a clear push-after-commit option. GitKraken describes these in its [file editing](https://help.gitkraken.com/gitkraken-desktop/editing-files/) and [commit](https://help.gitkraken.com/gitkraken-desktop/commits/) guides.
 5. **Git LFS follow-up.** Add locked-file workflows and safe local-object pruning. Define how GitVibe should present LFS migration, which can rewrite existing history, before offering it in the UI. See GitKraken's [LFS guide](https://help.gitkraken.com/gitkraken-desktop/git-lfs/).
 6. **System tray behavior.** The new logo appears in application windows, taskbars, Dock, and packages. A persistent notification-area or menu-bar item still needs close-versus-minimize behavior and platform-specific interaction design.
 
 ## Needs account or distribution decisions
 
 1. GitLab and Bitbucket pull request workflows need a chosen authentication model and API scope. GitHub currently uses the user's local `gh` login. A common built-in OAuth integration would require app credentials and a secure token storage design.
-2. Package signing and notarization need Windows signing credentials and Apple Developer identities. Windows has an installer and in-app install flow; Linux and macOS still require manual replacement after download.
+2. **Windows package signing and macOS notarization.** Windows releases currently ship unsigned. For public downloads, sign both `gitvibe.exe` and the Windows installer, timestamp the signatures, and verify them in release CI. Microsoft [recommends Azure Artifact Signing](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/code-signing-options) for eligible publishers, but [Public Trust individual enrollment is currently limited to the US and Canada](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart); an individual publisher in France should use an OV code-signing certificate from a trusted CA, while an eligible EU organization can use Azure Artifact Signing. Self-signed certificates do not establish public trust, and SmartScreen reputation can take time even after signing. Select the publisher identity and provision its credentials outside the repository before enabling signing. macOS notarization requires an Apple Developer identity. Linux and macOS still require manual replacement after download.
 3. A true embedded PTY needs a cross-platform terminal backend. The current command dock runs shell commands and keeps working-directory history, but interactive editors and full-screen programs cannot use it.
 4. Issue and team panes require a provider and account model. GitKraken's [integrations](https://help.gitkraken.com/gitkraken-desktop/integrations/) and [team features](https://help.gitkraken.com/gitkraken-desktop/teams/) rely on hosted services.
 5. Commit and tag signing controls need a decision on whether GitVibe should expose only the user's existing Git signing configuration or also manage signing keys. GitKraken supports both GPG and SSH signing in its [signing guide](https://help.gitkraken.com/gitkraken-desktop/commit-signing-with-gpg/).
