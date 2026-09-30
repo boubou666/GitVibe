@@ -79,6 +79,121 @@ pub struct RebasePlan {
 }
 
 #[derive(Clone)]
+pub struct IndexChange {
+    pub repo: PathBuf,
+    pub head: String,
+    pub branch: String,
+    pub before: String,
+    pub after: String,
+    pub label: String,
+}
+
+struct IndexState {
+    head: String,
+    branch: String,
+    tree: String,
+}
+
+fn index_state(repo: &Path) -> Result<IndexState, String> {
+    Ok(IndexState {
+        head: run(repo, &["rev-parse", "--verify", "HEAD"]).unwrap_or_else(|_| "<unborn>".into()),
+        branch: run(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+            .unwrap_or_else(|_| "<detached>".into()),
+        tree: run(repo, &["write-tree"])?,
+    })
+}
+
+pub fn is_index_mutation(args: &[String]) -> bool {
+    match args.first().map(String::as_str) {
+        Some("add") => true,
+        Some("restore") => args.iter().any(|arg| arg == "--staged"),
+        Some("rm") => args.iter().any(|arg| arg == "--cached"),
+        _ => false,
+    }
+}
+
+pub fn with_index_history<F>(
+    repo: &Path,
+    label: &str,
+    operation: F,
+) -> Result<(String, Option<IndexChange>), String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    let before = index_state(repo).ok();
+    let output = operation()?;
+    let after = index_state(repo).ok();
+    let change = before.zip(after).and_then(|(before, after)| {
+        if before.head != after.head || before.branch != after.branch || before.tree == after.tree {
+            None
+        } else {
+            Some(IndexChange {
+                repo: repo.to_path_buf(),
+                head: before.head,
+                branch: before.branch,
+                before: before.tree,
+                after: after.tree,
+                label: label.to_owned(),
+            })
+        }
+    });
+    Ok((output, change))
+}
+
+pub fn replay_index_change(
+    repo: &Path,
+    change: &IndexChange,
+    redo: bool,
+) -> Result<String, String> {
+    if repo != change.repo {
+        return Err("This staging action belongs to another repository".into());
+    }
+    let current = index_state(repo)?;
+    if current.head != change.head || current.branch != change.branch {
+        return Err("Branch history changed; the staging action can no longer be replayed".into());
+    }
+    let (expected, target) = if redo {
+        (&change.before, &change.after)
+    } else {
+        (&change.after, &change.before)
+    };
+    if &current.tree != expected {
+        return Err("The index changed since this action. Refresh and stage manually.".into());
+    }
+    let patch_output = git_output(
+        Some(repo),
+        &[
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-color",
+            &change.before,
+            &change.after,
+        ],
+    )?;
+    if !patch_output.status.success() {
+        return Err(String::from_utf8_lossy(&patch_output.stderr)
+            .trim()
+            .to_owned());
+    }
+    let patch = String::from_utf8(patch_output.stdout)
+        .map_err(|_| "Git returned a non-text binary patch".to_owned())?;
+    if patch.is_empty() {
+        return Err("The recorded staging change has no patch".into());
+    }
+    apply_patch(repo, &patch, !redo, false)?;
+    if index_state(repo)?.tree != *target {
+        return Err("The index did not match the expected result after replay".into());
+    }
+    Ok(format!(
+        "{}: {}",
+        if redo { "Redid" } else { "Undid" },
+        change.label
+    ))
+}
+
+#[derive(Clone)]
 pub struct FileStatus {
     pub index: char,
     pub worktree: char,
@@ -2280,5 +2395,76 @@ mod tests {
         );
         assert_eq!(rows[4].old.as_ref().map(|side| side.number), Some(13));
         assert_eq!(rows[4].new.as_ref().map(|side| side.number), Some(14));
+    }
+
+    #[test]
+    fn replays_staging_only_when_index_and_branch_match() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gitvibe-index-undo-{}-{unique}",
+            std::process::id()
+        ));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        std::fs::write(root.join("one.txt"), "before\n").unwrap();
+        run(&root, &["add", "one.txt"]).unwrap();
+        run(&root, &["commit", "-m", "Base"]).unwrap();
+        std::fs::write(root.join("one.txt"), "after\n").unwrap();
+        let (_, change) =
+            with_index_history(&root, "Stage one.txt", || run(&root, &["add", "one.txt"])).unwrap();
+        let change = change.expect("staging should change the index");
+        assert!(snapshot(&root).unwrap().status[0].staged());
+        replay_index_change(&root, &change, false).unwrap();
+        assert!(!snapshot(&root).unwrap().status[0].staged());
+        assert_eq!(
+            std::fs::read_to_string(root.join("one.txt"))
+                .unwrap()
+                .trim(),
+            "after"
+        );
+        replay_index_change(&root, &change, true).unwrap();
+        assert!(snapshot(&root).unwrap().status[0].staged());
+        std::fs::write(root.join("two.txt"), "other\n").unwrap();
+        run(&root, &["add", "two.txt"]).unwrap();
+        assert!(replay_index_change(&root, &change, false).is_err());
+        assert!(
+            snapshot(&root)
+                .unwrap()
+                .status
+                .iter()
+                .any(|file| file.path == "two.txt" && file.staged())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replays_initial_and_binary_staging() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gitvibe-index-binary-{}-{unique}",
+            std::process::id()
+        ));
+        let root = init(&root).unwrap();
+        let bytes = [0, 1, 2, 3, 255, 0, 42];
+        std::fs::write(root.join("binary.dat"), bytes).unwrap();
+        let (_, change) = with_index_history(&root, "Stage binary.dat", || {
+            run(&root, &["add", "binary.dat"])
+        })
+        .unwrap();
+        let change = change.expect("initial staging should change the index");
+        assert!(snapshot(&root).unwrap().status[0].staged());
+        replay_index_change(&root, &change, false).unwrap();
+        assert!(!snapshot(&root).unwrap().status[0].staged());
+        assert_eq!(std::fs::read(root.join("binary.dat")).unwrap(), bytes);
+        replay_index_change(&root, &change, true).unwrap();
+        assert!(snapshot(&root).unwrap().status[0].staged());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
