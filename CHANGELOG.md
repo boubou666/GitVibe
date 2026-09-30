@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-30
+
+### Added
+
+- Set a commit author name and email on first launch. Save multiple profiles, manage them in Preferences from the top-right header, and switch the active profile from that header.
+- Apply the active profile to commits made in GitVibe without changing repository or global Git settings. Optionally sync the active identity to global `.gitconfig` from Preferences.
+- Select multiple changed files with Ctrl/Cmd+click and use the right-click menu to stage, unstage, stash, discard tracked edits with confirmation, or export a patch. Open a file in its default app or show it in the system file manager.
+
+### Changed
+
+- Remove co-author inputs from the commit form; the selected profile is shown beside the commit action.
+- Group file actions, inspection tools, and diff display controls in separate sections.
+
+### Fixed
+
+- Align the history search field and Search and Clear buttons at the same height, with matching button widths and room against the pane edge.
+- Give toolbar icons a consistent gap from their labels.
+- Highlight hovered repository tabs and changed-file rows, and show an inline stage or unstage button on hover.
+- Replace the worktree changes strip in commit details with a quieter two-line card.
+
 ## [0.18.0] - 2026-09-30
 
 ### Added
@@ -204,7 +224,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/boubou666/GitVibe/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/boubou666/GitVibe/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/boubou666/GitVibe/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/boubou666/GitVibe/compare/v0.15.0...v0.16.0

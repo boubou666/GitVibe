@@ -191,34 +191,6 @@ pub fn commit_template(repo: &Path) -> Result<Option<String>, String> {
     Ok((!message.is_empty()).then_some(message))
 }
 
-pub fn message_with_coauthor(message: &str, name: &str, email: &str) -> Result<String, String> {
-    let mut message = message.trim_end().to_owned();
-    let name = name.trim();
-    let email = email.trim();
-    let valid_email = email.split_once('@').is_some_and(|(local, domain)| {
-        !local.is_empty() && !domain.is_empty() && !domain.contains('@')
-    });
-    if name.is_empty() && email.is_empty() {
-        return Ok(message);
-    }
-    if name.is_empty()
-        || name.contains(['\n', '\r', '<', '>'])
-        || email.is_empty()
-        || !valid_email
-        || email.contains(['\n', '\r', '<', '>', ' ', '\t'])
-    {
-        return Err("Enter a co-author name and email address".into());
-    }
-    let trailer = format!("Co-authored-by: {name} <{email}>");
-    if !message.lines().any(|line| line == trailer) {
-        if !message.is_empty() {
-            message.push_str("\n\n");
-        }
-        message.push_str(&trailer);
-    }
-    Ok(message)
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RebaseAction {
     Pick,
@@ -1132,6 +1104,48 @@ pub fn run_owned(repo: &Path, args: &[String]) -> Result<String, String> {
     run(repo, &refs)
 }
 
+pub fn global_config(key: &str) -> Option<String> {
+    let output = git_output(None, &["config", "--global", "--get", key]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+pub fn set_global_identity(name: &str, email: &str) -> Result<(), String> {
+    let old_name = global_config("user.name");
+    let name_result = git_output(
+        None,
+        &["config", "--global", "--replace-all", "user.name", name],
+    )?;
+    if !name_result.status.success() {
+        return Err(String::from_utf8_lossy(&name_result.stderr)
+            .trim()
+            .to_owned());
+    }
+    let email_result = git_output(
+        None,
+        &["config", "--global", "--replace-all", "user.email", email],
+    );
+    if !email_result
+        .as_ref()
+        .is_ok_and(|output| output.status.success())
+    {
+        let mut rollback = vec!["config", "--global"];
+        if let Some(ref old_name) = old_name {
+            rollback.extend(["--replace-all", "user.name", old_name]);
+        } else {
+            rollback.extend(["--unset-all", "user.name"]);
+        }
+        let _ = git_output(None, &rollback);
+        return Err(match email_result {
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            Err(error) => error,
+        });
+    }
+    Ok(())
+}
+
 /// Read a text version of a file without loading arbitrarily large blobs for diff coloring.
 /// `revision` is a Git tree-ish, `:` for the index, or `None` for the worktree.
 pub fn diff_source_text(repo: &Path, revision: Option<&str>, path: &str) -> Option<String> {
@@ -1972,7 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_configured_commit_template_and_adds_coauthor_once() {
+    fn loads_configured_commit_template() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1999,16 +2013,6 @@ mod tests {
             commit_template(&root).unwrap().as_deref(),
             Some("Subject\n\nDetails")
         );
-        let message = message_with_coauthor("Subject", "Alex", "alex@example.invalid").unwrap();
-        assert_eq!(
-            message,
-            "Subject\n\nCo-authored-by: Alex <alex@example.invalid>"
-        );
-        assert_eq!(
-            message_with_coauthor(&message, "Alex", "alex@example.invalid").unwrap(),
-            message
-        );
-        assert!(message_with_coauthor("Subject", "Alex", "bad email").is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 

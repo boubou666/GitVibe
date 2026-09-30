@@ -13,7 +13,9 @@ use std::{
 use crate::{
     external,
     git::{self, Snapshot},
-    github, logging, syntax, updates,
+    github, logging,
+    profiles::Profile,
+    syntax, updates,
 };
 use eframe::egui::{self, Color32, RichText, Stroke};
 
@@ -173,6 +175,7 @@ enum Page {
     PullRequests,
     Console,
     Updates,
+    Preferences,
 }
 
 #[derive(Clone, Copy)]
@@ -196,7 +199,7 @@ impl PaletteAction {
     fn needs_repository(self) -> bool {
         !matches!(
             self,
-            Self::Show(Page::Repositories | Page::NewTab | Page::Changelog)
+            Self::Show(Page::Repositories | Page::NewTab | Page::Changelog | Page::Preferences)
         )
     }
 
@@ -254,6 +257,10 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("Pull", PaletteAction::Pull),
     ("Push", PaletteAction::Push),
     ("Updates", PaletteAction::Show(Page::Updates)),
+    (
+        "Preferences and profiles",
+        PaletteAction::Show(Page::Preferences),
+    ),
     ("Changelog", PaletteAction::Show(Page::Changelog)),
 ];
 
@@ -321,6 +328,7 @@ enum Job {
     Init(PathBuf),
     Clone(String, PathBuf, bool, bool),
     Run(Vec<String>),
+    Commit(String, Profile),
     Undo(UndoAction, bool),
     CheckMergeTarget(String),
     LoadLfs,
@@ -439,6 +447,12 @@ pub struct GitVibe {
     merge_check_error: String,
     theme_choice: ThemeChoice,
     pull_mode: PullMode,
+    profiles: Vec<Profile>,
+    active_profile: usize,
+    sync_global_profile: bool,
+    profile_draft: Profile,
+    editing_profile: Option<usize>,
+    preferences_return: Page,
     snapshot: Option<Snapshot>,
     page: Page,
     path_input: String,
@@ -480,8 +494,6 @@ pub struct GitVibe {
     commit_message: String,
     commit_template: Option<String>,
     template_loaded_for: Option<PathBuf>,
-    coauthor_name: String,
-    coauthor_email: String,
     command_input: String,
     terminal_output: String,
     terminal_cwd: Option<PathBuf>,
@@ -497,6 +509,7 @@ pub struct GitVibe {
     compare_base: Option<String>,
     history_limit: usize,
     selected_file: Option<String>,
+    selected_files: Vec<String>,
     selected_file_staged: bool,
     detail: String,
     syntax_cache: HashMap<(String, String), Arc<syntax::HunkColors>>,
@@ -525,7 +538,7 @@ pub struct GitVibe {
     pending: Option<Job>,
     busy: bool,
     show_clone: bool,
-    confirm_discard: Option<String>,
+    confirm_discard: Option<Vec<String>>,
     confirm_discard_hunk: Option<String>,
     confirm_commit_action: Option<(CommitAction, String)>,
     confirm_checkout_commit: Option<String>,
@@ -588,6 +601,27 @@ impl GitVibe {
             .storage
             .and_then(|storage| eframe::get_value::<PullMode>(storage, "pull_mode"))
             .unwrap_or(PullMode::Merge);
+        let profiles = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<Vec<Profile>>(storage, "profiles"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|profile| profile.validate().is_ok())
+            .collect::<Vec<_>>();
+        let active_profile = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<usize>(storage, "active_profile"))
+            .unwrap_or(0)
+            .min(profiles.len().saturating_sub(1));
+        let sync_global_profile = cc
+            .storage
+            .and_then(|storage| eframe::get_value::<bool>(storage, "sync_global_profile"))
+            .unwrap_or(false);
+        let profile_draft = Profile {
+            label: "Default Profile".into(),
+            name: git::global_config("user.name").unwrap_or_default(),
+            email: git::global_config("user.email").unwrap_or_default(),
+        };
         let merge_targets = cc
             .storage
             .and_then(|storage| {
@@ -685,6 +719,12 @@ impl GitVibe {
             merge_check_error: String::new(),
             theme_choice,
             pull_mode,
+            profiles,
+            active_profile,
+            sync_global_profile,
+            profile_draft,
+            editing_profile: None,
+            preferences_return: Page::History,
             snapshot: None,
             page: Page::History,
             path_input: path.to_string_lossy().into_owned(),
@@ -729,8 +769,6 @@ impl GitVibe {
             commit_message: String::new(),
             commit_template: None,
             template_loaded_for: None,
-            coauthor_name: String::new(),
-            coauthor_email: String::new(),
             command_input: String::new(),
             terminal_output: String::new(),
             terminal_cwd: None,
@@ -746,6 +784,7 @@ impl GitVibe {
             compare_base: None,
             history_limit: 300,
             selected_file: None,
+            selected_files: Vec::new(),
             selected_file_staged: false,
             detail: String::new(),
             syntax_cache: HashMap::new(),
@@ -796,6 +835,12 @@ impl GitVibe {
             update_state: UpdateState::Checking,
             update_receiver: None,
         };
+        if app.sync_global_profile
+            && let Some(profile) = app.profiles.get(app.active_profile)
+            && let Err(error) = git::set_global_identity(&profile.name, &profile.email)
+        {
+            app.error = format!("Could not update global Git identity: {error}");
+        }
         if git::discover(&path).is_ok() {
             app.pending = Some(Job::Open(path));
         } else {
@@ -881,6 +926,7 @@ impl GitVibe {
             return;
         };
         let repo = self.repo.clone();
+        let active_profile = self.profiles.get(self.active_profile).cloned();
         let history_limit = self.history_limit;
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
@@ -935,10 +981,15 @@ impl GitVibe {
                     } else {
                         "Unstage changes"
                     };
-                    finish_index_job(repo, history_limit, label, |path| git::run_owned(path, &args))
+                    let command = match &active_profile {
+                        Some(profile) => profile.scoped_args(args),
+                        None => args,
+                    };
+                    finish_index_job(repo, history_limit, label, |path| git::run_owned(path, &command))
                 }
-                Job::Run(args) if args.first().is_some_and(|arg| arg == "commit") => match repo {
+                Job::Commit(message, profile) => match repo {
                     Some(p) => {
+                        let args = profile.commit_args(message);
                         let operation = git::with_commit_history(&p, || git::run_owned(&p, &args));
                         match git::snapshot_with_limit(&p, history_limit) {
                             Ok(snapshot) => match operation {
@@ -952,7 +1003,11 @@ impl GitVibe {
                 },
                 Job::Run(args) => match repo {
                     Some(p) => {
-                        let operation = git::run_owned(&p, &args);
+                        let command = match &active_profile {
+                            Some(profile) => profile.scoped_args(args),
+                            None => args,
+                        };
+                        let operation = git::run_owned(&p, &command);
                         match git::snapshot_with_limit(&p, history_limit) {
                             Ok(snapshot) => {
                                 if !snapshot.rebase_in_progress {
@@ -1244,8 +1299,6 @@ impl GitVibe {
                         self.commit_message.clear();
                         self.commit_template = None;
                         self.template_loaded_for = None;
-                        self.coauthor_name.clear();
-                        self.coauthor_email.clear();
                         self.confirm_restore_file = None;
                         self.lfs_status = None;
                         self.lfs_loaded_for = None;
@@ -1256,6 +1309,7 @@ impl GitVibe {
                         self.terminal_output.clear();
                         self.selected_commit = None;
                         self.selected_file = None;
+                        self.selected_files.clear();
                         self.detail.clear();
                         self.compare_base = None;
                         self.search_results.clear();
@@ -1282,11 +1336,13 @@ impl GitVibe {
                         self.open_repo_tabs.push(snapshot.root.clone());
                     }
                     let first_commit = snapshot.commits.first().map(|commit| commit.id.clone());
+                    self.prune_changed_file_selection(&snapshot);
                     self.snapshot = Some(snapshot);
                     self.interactive_plan = None;
                     self.error.clear();
                     if self.selected_commit.is_none()
                         && self.selected_file.is_none()
+                        && self.selected_files.is_empty()
                         && let Some(id) = first_commit
                     {
                         self.select_commit(&id);
@@ -1329,6 +1385,7 @@ impl GitVibe {
                         self.notice = self.output.clone();
                     }
                     self.repo = Some(snapshot.root.clone());
+                    self.prune_changed_file_selection(&snapshot);
                     self.snapshot = Some(snapshot);
                     self.interactive_plan = None;
                     if let Some(id) = new_head.or(focus_commit) {
@@ -1366,12 +1423,14 @@ impl GitVibe {
                             self.queue(Job::Inspect(args));
                         } else {
                             self.selected_file = None;
+                            self.selected_files.clear();
                             self.detail.clear();
                         }
                     }
                     self.hunk_action = false;
                     if self.conflict_action {
                         self.selected_file = None;
+                        self.selected_files.clear();
                         self.detail.clear();
                         self.conflict_editor = None;
                     }
@@ -1395,6 +1454,7 @@ impl GitVibe {
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.repo = Some(snapshot.root.clone());
+                self.prune_changed_file_selection(&snapshot);
                 self.snapshot = Some(snapshot);
                 self.interactive_plan = None;
                 self.error = error;
@@ -1581,6 +1641,7 @@ impl GitVibe {
                     }
             }) {
                 self.selected_file = None;
+                self.selected_files.clear();
                 self.detail.clear();
                 self.syntax_cache.clear();
             } else if let Some((diff_path, diff_staged, detail, colors)) = changed_diff
@@ -1596,6 +1657,7 @@ impl GitVibe {
                     .collect();
             }
         }
+        self.prune_changed_file_selection(&snapshot);
         self.snapshot = Some(snapshot);
     }
 
@@ -2270,15 +2332,240 @@ impl GitVibe {
                 self.snapshot = None;
                 self.selected_commit = None;
                 self.selected_file = None;
+                self.selected_files.clear();
                 self.detail.clear();
                 self.page = Page::Repositories;
             }
         }
     }
 
+    fn open_preferences(&mut self) {
+        if self.page != Page::Preferences {
+            self.preferences_return = self.page;
+        }
+        if let Some(profile) = self.profiles.get(self.active_profile) {
+            self.profile_draft = profile.clone();
+            self.editing_profile = Some(self.active_profile);
+        }
+        self.page = Page::Preferences;
+    }
+
+    fn activate_profile(&mut self, index: usize) {
+        let Some(profile) = self.profiles.get(index) else {
+            return;
+        };
+        if self.sync_global_profile
+            && let Err(error) = git::set_global_identity(&profile.name, &profile.email)
+        {
+            self.error = format!("Could not update global Git identity: {error}");
+            return;
+        }
+        self.active_profile = index;
+        self.notice = format!("Commit profile: {}", profile.label);
+    }
+
+    fn save_profile_draft(&mut self) {
+        let profile = self.profile_draft.clone().normalized();
+        if let Err(error) = profile.validate() {
+            self.error = error.into();
+            return;
+        }
+        if self.profiles.iter().enumerate().any(|(index, existing)| {
+            Some(index) != self.editing_profile && existing.label == profile.label
+        }) {
+            self.error = "Profile names must be unique".into();
+            return;
+        }
+        let index = self.editing_profile.unwrap_or(self.profiles.len());
+        let becomes_active = self.profiles.is_empty()
+            || index == self.active_profile
+            || self.editing_profile.is_none();
+        if becomes_active
+            && self.sync_global_profile
+            && let Err(error) = git::set_global_identity(&profile.name, &profile.email)
+        {
+            self.error = format!("Could not update global Git identity: {error}");
+            return;
+        }
+        if index == self.profiles.len() {
+            self.profiles.push(profile.clone());
+        } else {
+            self.profiles[index] = profile.clone();
+        }
+        self.editing_profile = Some(index);
+        self.profile_draft = profile.clone();
+        if becomes_active {
+            self.active_profile = index;
+        }
+        self.error.clear();
+        self.notice = format!("Saved profile {}", profile.label);
+    }
+
+    fn profile_editor(&mut self, ui: &mut egui::Ui, first_launch: bool) {
+        ui.label(RichText::new("Profile name").size(11.0).color(muted()));
+        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.label).desired_width(340.0));
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Commit author name")
+                .size(11.0)
+                .color(muted()),
+        );
+        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.name).desired_width(340.0));
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Commit author email")
+                .size(11.0)
+                .color(muted()),
+        );
+        ui.add(egui::TextEdit::singleline(&mut self.profile_draft.email).desired_width(340.0));
+        ui.add_space(10.0);
+        if ui
+            .add(
+                egui::Button::new(if first_launch {
+                    "Create profile"
+                } else {
+                    "Save profile"
+                })
+                .fill(accent()),
+            )
+            .clicked()
+        {
+            self.save_profile_draft();
+        }
+        if !self.error.is_empty() {
+            ui.colored_label(red(), &self.error);
+        }
+    }
+
+    fn preferences_page(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("← Back to workspace").clicked() {
+                self.page = self.preferences_return;
+            }
+            ui.heading("Preferences");
+        });
+        ui.separator();
+        ui.add_space(12.0);
+        ui.heading("Profiles");
+        ui.label("Choose the name and email used for commits created in GitVibe.");
+        let mut sync = self.sync_global_profile;
+        if ui
+            .checkbox(
+                &mut sync,
+                "Keep my global .gitconfig identity updated with the active profile",
+            )
+            .changed()
+        {
+            if sync {
+                if let Some(profile) = self.profiles.get(self.active_profile) {
+                    match git::set_global_identity(&profile.name, &profile.email) {
+                        Ok(()) => self.sync_global_profile = true,
+                        Err(error) => {
+                            self.error = format!("Could not update global Git identity: {error}")
+                        }
+                    }
+                } else {
+                    self.sync_global_profile = true;
+                }
+            } else {
+                self.sync_global_profile = false;
+            }
+        }
+        ui.label(RichText::new("Off by default. GitVibe commits still use the active profile without changing global Git settings.").size(11.0).color(muted()));
+        ui.add_space(12.0);
+        for (index, profile) in self.profiles.clone().into_iter().enumerate() {
+            egui::Frame::new()
+                .fill(if index == self.active_profile {
+                    elevated()
+                } else {
+                    panel()
+                })
+                .stroke(Stroke::new(1.0, border()))
+                .inner_margin(egui::Margin::same(9))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&profile.label).strong());
+                            ui.label(
+                                RichText::new(format!("{}  <{}>", profile.name, profile.email))
+                                    .size(11.0)
+                                    .color(muted()),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.profiles.len() > 1
+                                && index != self.active_profile
+                                && ui.button("Delete").clicked()
+                            {
+                                self.profiles.remove(index);
+                                if self.active_profile > index {
+                                    self.active_profile -= 1;
+                                }
+                                self.editing_profile = None;
+                            }
+                            if ui.button("Edit").clicked() {
+                                self.profile_draft = profile.clone();
+                                self.editing_profile = Some(index);
+                            }
+                            if index != self.active_profile {
+                                if ui.button("Use").clicked() {
+                                    self.activate_profile(index);
+                                }
+                            } else {
+                                ui.label(RichText::new("ACTIVE").size(10.0).color(accent()));
+                            }
+                        });
+                    });
+                });
+            ui.add_space(5.0);
+        }
+        ui.add_space(9.0);
+        ui.horizontal(|ui| {
+            ui.heading(if self.editing_profile.is_some() {
+                "Edit profile"
+            } else {
+                "New profile"
+            });
+            if ui.button("+ New profile").clicked() {
+                self.editing_profile = None;
+                self.profile_draft = Profile {
+                    label: String::new(),
+                    name: String::new(),
+                    email: String::new(),
+                };
+                self.error.clear();
+            }
+        });
+        self.profile_editor(ui, false);
+            });
+    }
+
+    fn first_launch_profile_dialog(&mut self, ctx: &egui::Context) {
+        if !self.profiles.is_empty() {
+            return;
+        }
+        egui::Modal::new(egui::Id::new("first_commit_profile")).show(ctx, |ui| {
+            ui.heading("Set up your commit profile");
+            ui.label("Enter the author name and email GitVibe will use for your commits.");
+            ui.add_space(8.0);
+            self.profile_editor(ui, true);
+        });
+    }
+
     fn workspace_tabs(&mut self, ui: &mut egui::Ui) {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.spacing_mut().interact_size.y = 34.0;
+        let fixed_width = 124.0
+            + if self.changelog_open { 142.0 } else { 0.0 }
+            + if self.new_tab_open { 118.0 } else { 0.0 }
+            + 30.0 // New tab button
+            + 385.0 // Theme, Preferences, and profile controls
+            + 90.0; // Overflow menu
+        let visible_tabs =
+            (((ui.available_width() - fixed_width) / 150.0).floor() as usize).clamp(1, 6);
         ui.horizontal(|ui| {
             let (open_launchpad, _) = workspace_tab(
                 ui,
@@ -2293,7 +2580,7 @@ impl GitVibe {
             }
 
             let tabs = self.open_repo_tabs.clone();
-            for path in tabs.iter().take(6) {
+            for path in tabs.iter().take(visible_tabs) {
                 let full_name = path
                     .file_name()
                     .unwrap_or(path.as_os_str())
@@ -2305,7 +2592,7 @@ impl GitVibe {
                 let selected = self.repo.as_deref() == Some(path.as_path())
                     && !matches!(
                         self.page,
-                        Page::Repositories | Page::Changelog | Page::NewTab
+                        Page::Repositories | Page::Changelog | Page::NewTab | Page::Preferences
                     );
                 let (opened, closed) = workspace_tab(
                     ui,
@@ -2324,9 +2611,9 @@ impl GitVibe {
                     self.page = Page::History;
                 }
             }
-            if tabs.len() > 6 {
-                ui.menu_button(format!("More ({})", tabs.len() - 6), |ui| {
-                    for path in tabs.iter().skip(6) {
+            if tabs.len() > visible_tabs {
+                ui.menu_button(format!("More ({})", tabs.len() - visible_tabs), |ui| {
+                    for path in tabs.iter().skip(visible_tabs) {
                         if ui
                             .button(
                                 path.file_name()
@@ -2398,6 +2685,36 @@ impl GitVibe {
                 self.page = Page::NewTab;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let active_label = self
+                    .profiles
+                    .get(self.active_profile)
+                    .map(|profile| profile.label.as_str())
+                    .unwrap_or("Set up profile");
+                let short_label = active_label.chars().take(16).collect::<String>();
+                ui.menu_button(format!("Profile: {short_label}"), |ui| {
+                    ui.label(RichText::new("COMMIT PROFILE").size(10.0).color(muted()));
+                    for (index, profile) in self.profiles.clone().into_iter().enumerate() {
+                        if ui
+                            .selectable_label(
+                                index == self.active_profile,
+                                format!("{}  ·  {}", profile.label, profile.name),
+                            )
+                            .on_hover_text(&profile.email)
+                            .clicked()
+                        {
+                            self.activate_profile(index);
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Manage profiles…").clicked() {
+                        self.open_preferences();
+                        ui.close();
+                    }
+                });
+                if ui.button("Preferences").clicked() {
+                    self.open_preferences();
+                }
                 ui.menu_button(
                     RichText::new(format!("Theme: {}", self.theme_choice.label()))
                         .size(11.0)
@@ -2775,8 +3092,10 @@ impl GitVibe {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Viewing history").size(11.0).color(muted()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                const SEARCH_CONTROL_HEIGHT: f32 = 28.0;
+                ui.add_space(12.0);
                 if ui
-                    .add_sized([58.0, 25.0], egui::Button::new("Clear"))
+                    .add_sized([72.0, SEARCH_CONTROL_HEIGHT], egui::Button::new("Clear"))
                     .clicked()
                 {
                     self.search.clear();
@@ -2784,16 +3103,16 @@ impl GitVibe {
                     self.search_results.clear();
                 }
                 if ui
-                    .add_enabled(
-                        !self.busy && !self.search.trim().is_empty(),
-                        egui::Button::new("Search").min_size(egui::vec2(66.0, 25.0)),
-                    )
+                    .add_enabled_ui(!self.busy && !self.search.trim().is_empty(), |ui| {
+                        ui.add_sized([72.0, SEARCH_CONTROL_HEIGHT], egui::Button::new("Search"))
+                    })
+                    .inner
                     .clicked()
                 {
                     self.queue(Job::SearchHistory(self.search.clone()));
                 }
                 let search_edit = ui.add_sized(
-                    [250.0, 25.0],
+                    [250.0, SEARCH_CONTROL_HEIGHT],
                     egui::TextEdit::singleline(&mut self.search)
                         .id(egui::Id::new("history_search"))
                         .hint_text("Search commits, authors or SHA")
@@ -3048,6 +3367,7 @@ impl GitVibe {
         self.selected_commit = Some(id.to_owned());
         self.selected_commit_file = None;
         self.selected_file = None;
+        self.selected_files.clear();
         self.selected_file_staged = false;
         self.detail.clear();
         self.commit_files.clear();
@@ -3506,31 +3826,15 @@ impl GitVibe {
                         .desired_width(ui.available_width())
                         .desired_rows(2),
                 );
-                ui.label(
-                    RichText::new("CO-AUTHOR  |  OPTIONAL")
-                        .size(10.0)
-                        .color(muted()),
-                );
-                let field_width = ((ui.available_width() - 6.0) / 2.0).max(90.0);
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.coauthor_name)
-                            .hint_text("Name")
-                            .desired_width(field_width),
+                let message = self.commit_message.trim().to_owned();
+                if let Some(profile) = self.profiles.get(self.active_profile) {
+                    ui.label(
+                        RichText::new(format!("Commit as {} <{}>", profile.name, profile.email))
+                            .size(11.0)
+                            .color(muted()),
                     );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.coauthor_email)
-                            .hint_text("Email")
-                            .desired_width(field_width),
-                    );
-                });
-                let message = git::message_with_coauthor(
-                    &self.commit_message,
-                    &self.coauthor_name,
-                    &self.coauthor_email,
-                );
-                if let Err(error) = &message {
-                    ui.colored_label(orange(), error);
+                } else {
+                    ui.colored_label(orange(), "Set up a commit profile in Preferences");
                 }
                 ui.horizontal(|ui| {
                     ui.label(
@@ -3546,9 +3850,8 @@ impl GitVibe {
                         if ui
                             .add_enabled(
                                 !self.busy
-                                    && message
-                                        .as_ref()
-                                        .is_ok_and(|message| !message.trim().is_empty())
+                                    && !message.is_empty()
+                                    && self.profiles.get(self.active_profile).is_some()
                                     && (!staged.is_empty() || snapshot.merge_in_progress)
                                     && conflicts.is_empty(),
                                 egui::Button::new(
@@ -3566,8 +3869,8 @@ impl GitVibe {
                             .clicked()
                         {
                             self.committing = true;
-                            if let Ok(message) = message {
-                                self.git_owned(vec!["commit".into(), "-m".into(), message]);
+                            if let Some(profile) = self.profiles.get(self.active_profile).cloned() {
+                                self.queue(Job::Commit(message, profile));
                             }
                         }
                     });
@@ -3577,6 +3880,7 @@ impl GitVibe {
 
     fn select_changed_file(&mut self, file: &git::FileStatus, staged: bool) {
         self.selected_file = Some(file.path.clone());
+        self.selected_files = vec![file.path.clone()];
         self.selected_file_staged = staged;
         self.diff_hunk_focus = 0;
         self.diff_scroll_pending = true;
@@ -3601,45 +3905,276 @@ impl GitVibe {
         }
     }
 
-    fn file_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus, staged: bool) {
-        let selected = self.selected_file.as_deref() == Some(&file.path)
-            && self.selected_file_staged == staged;
-        let status = if file.index == '?' {
-            "NEW"
-        } else if staged {
-            "STAGED"
-        } else {
-            "EDITED"
-        };
-        let row = egui::Frame::new()
-            .fill(if selected { elevated() } else { panel() })
-            .inner_margin(egui::Margin::symmetric(6, 1))
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(if status == "NEW" { "+" } else { "M" })
-                            .size(11.0)
-                            .strong()
-                            .color(if staged { accent() } else { orange() }),
-                    );
-                    if ui
-                        .add(
-                            egui::Button::new(RichText::new(&file.path).size(12.0).color(text()))
-                                .fill(Color32::TRANSPARENT)
-                                .stroke(Stroke::NONE),
-                        )
-                        .clicked()
-                    {
-                        self.select_changed_file(file, staged);
+    fn prune_changed_file_selection(&mut self, snapshot: &Snapshot) {
+        self.selected_files.retain(|path| {
+            snapshot.status.iter().any(|file| {
+                file.path == *path
+                    && if self.selected_file_staged {
+                        file.staged()
+                    } else {
+                        file.unstaged()
                     }
-                });
+            })
+        });
+        if self
+            .selected_file
+            .as_ref()
+            .is_some_and(|path| !self.selected_files.contains(path))
+        {
+            self.selected_file = None;
+            self.detail.clear();
+            self.syntax_cache.clear();
+        }
+    }
+
+    fn stage_file_paths(&mut self, paths: Vec<String>, staged: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        let mut args = if staged {
+            if self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.commits.is_empty())
+            {
+                vec!["rm".into(), "--cached".into(), "--".into()]
+            } else {
+                vec!["restore".into(), "--staged".into(), "--".into()]
+            }
+        } else {
+            vec!["add".into(), "--".into()]
+        };
+        args.extend(paths);
+        self.git_owned(args);
+    }
+
+    fn file_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus, staged: bool) {
+        let selected = self.selected_file_staged == staged
+            && self.selected_files.iter().any(|path| path == &file.path);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 30.0), egui::Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, &file.path)
+        });
+        ui.painter().rect_filled(
+            rect,
+            3.0,
+            if selected {
+                elevated()
+            } else if response.hovered() {
+                panel_alt()
+            } else {
+                panel()
+            },
+        );
+        if selected {
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, rect.height())),
+                0.0,
+                accent(),
+            );
+        }
+        if response.hovered() {
+            ui.painter().rect_stroke(
+                rect,
+                3.0,
+                Stroke::new(1.0, border()),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ui.painter().text(
+            egui::pos2(rect.left() + 10.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            if file.index == '?' { "+" } else { "M" },
+            egui::FontId::proportional(11.0),
+            if staged { accent() } else { orange() },
+        );
+        let show_stage = response.hovered() && !self.busy;
+        let stage_rect = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - 42.0, rect.center().y),
+            egui::vec2(72.0, 23.0),
+        );
+        ui.painter()
+            .with_clip_rect(egui::Rect::from_min_max(
+                egui::pos2(rect.left() + 29.0, rect.top()),
+                egui::pos2(
+                    if show_stage {
+                        stage_rect.left() - 5.0
+                    } else {
+                        rect.right() - 8.0
+                    },
+                    rect.bottom(),
+                ),
+            ))
+            .text(
+                egui::pos2(rect.left() + 29.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                &file.path,
+                egui::FontId::proportional(12.0),
+                text(),
+            );
+        let stage_clicked = show_stage
+            && ui
+                .put(
+                    stage_rect,
+                    egui::Button::new(if staged { "Unstage" } else { "Stage" })
+                        .fill(panel_alt())
+                        .stroke(Stroke::new(1.0, if staged { accent() } else { orange() })),
+                )
+                .clicked();
+        if stage_clicked {
+            self.stage_file_paths(vec![file.path.clone()], staged);
+        } else if response.clicked() {
+            let additive = ui.input(|input| input.modifiers.ctrl || input.modifiers.command);
+            if additive && self.selected_file_staged == staged && !self.selected_files.is_empty() {
+                if let Some(index) = self
+                    .selected_files
+                    .iter()
+                    .position(|path| path == &file.path)
+                {
+                    self.selected_files.remove(index);
+                    if self.selected_file.as_deref() == Some(&file.path) {
+                        self.selected_file = None;
+                        self.detail.clear();
+                    }
+                } else {
+                    self.selected_files.push(file.path.clone());
+                }
+            } else {
+                self.select_changed_file(file, staged);
+            }
+        }
+        if response.secondary_clicked() && !selected {
+            self.select_changed_file(file, staged);
+        }
+        let paths = self.selected_files.clone();
+        let all_tracked = !paths.is_empty()
+            && self.snapshot.as_ref().is_some_and(|snapshot| {
+                paths.iter().all(|path| {
+                    snapshot
+                        .status
+                        .iter()
+                        .any(|status| status.path == *path && status.index != '?')
+                })
             });
+        response.context_menu(|ui| {
+            ui.set_min_width(195.0);
+            ui.add_enabled_ui(!self.busy, |ui| {
+                if paths.len() > 1 {
+                    ui.label(
+                        RichText::new(format!("{} files selected", paths.len()))
+                            .size(11.0)
+                            .color(muted()),
+                    );
+                    ui.separator();
+                }
+                let verb = if staged { "Unstage" } else { "Stage" };
+                if ui
+                    .button(format!(
+                        "{verb} {}",
+                        if paths.len() == 1 {
+                            "file".to_owned()
+                        } else {
+                            format!("{} files", paths.len())
+                        }
+                    ))
+                    .clicked()
+                {
+                    self.stage_file_paths(paths.clone(), staged);
+                    ui.close();
+                }
+                if !staged
+                    && all_tracked
+                    && ui
+                        .button(if paths.len() == 1 {
+                            "Discard changes...".to_owned()
+                        } else {
+                            format!("Discard {} files...", paths.len())
+                        })
+                        .clicked()
+                {
+                    self.confirm_discard = Some(paths.clone());
+                    ui.close();
+                }
+                if ui
+                    .button(if paths.len() == 1 {
+                        "Stash file".to_owned()
+                    } else {
+                        format!("Stash {} files", paths.len())
+                    })
+                    .clicked()
+                {
+                    let mut args = vec!["stash".into(), "push".into(), "-u".into(), "--".into()];
+                    args.extend(paths.clone());
+                    self.git_owned(args);
+                    ui.close();
+                }
+                if all_tracked
+                    && ui.button("Create patch from changes...").clicked()
+                    && let Some(destination) = rfd::FileDialog::new()
+                        .set_file_name("changes.patch")
+                        .save_file()
+                {
+                    let mut args = vec![
+                        "diff".into(),
+                        "--binary".into(),
+                        "--no-ext-diff".into(),
+                        "--no-color".into(),
+                    ];
+                    if staged {
+                        args.push("--cached".into());
+                    }
+                    args.push("--".into());
+                    args.extend(paths.clone());
+                    self.queue(Job::ExportPatch(args, destination));
+                    ui.close();
+                }
+                if paths.len() == 1 {
+                    ui.separator();
+                    if ui.button("File history").clicked() {
+                        self.queue(Job::FileHistory(file.path.clone()));
+                        ui.close();
+                    }
+                    if ui.button("Blame").clicked() {
+                        self.queue(Job::Inspect(vec![
+                            "blame".into(),
+                            "--".into(),
+                            file.path.clone(),
+                        ]));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.button("Open in default app").clicked() {
+                        if let Some(repo) = &self.repo
+                            && let Err(error) = external::edit_file(repo, &file.path)
+                        {
+                            self.error = error;
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Show in folder").clicked() {
+                        if let Some(repo) = &self.repo
+                            && let Err(error) = external::show_in_folder(repo, &file.path)
+                        {
+                            self.error = error;
+                        }
+                        ui.close();
+                    }
+                    if ui.button("Copy file path").clicked() {
+                        if let Some(repo) = &self.repo {
+                            ui.ctx()
+                                .copy_text(repo.join(&file.path).display().to_string());
+                        }
+                        ui.close();
+                    }
+                }
+            });
+        });
         if selected && self.file_scroll_pending {
-            ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
+            ui.scroll_to_rect(rect, Some(egui::Align::Center));
             self.file_scroll_pending = false;
         }
-        ui.add_space(1.0);
+        ui.add_space(2.0);
     }
 
     fn conflict_row(&mut self, ui: &mut egui::Ui, file: &git::FileStatus) {
@@ -5154,166 +5689,164 @@ impl GitVibe {
                 },
             );
         });
-        ui.add_space(10.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Edit this file"))
-                .on_hover_text("Open the working file in its default editor")
-                .clicked()
-            {
-                let result = self
-                    .repo
-                    .as_ref()
-                    .ok_or("No repository selected".to_owned())
-                    .and_then(|repo| external::edit_file(repo, &path));
-                if let Err(error) = result {
-                    self.error = error;
-                }
-            }
-            if self.selected_file_staged {
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Unstage file"))
-                    .clicked()
-                {
-                    if self
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.commits.is_empty())
-                    {
-                        self.git_owned(vec![
-                            "rm".into(),
-                            "--cached".into(),
-                            "--".into(),
-                            path.clone(),
-                        ]);
-                    } else {
-                        self.git_owned(vec![
-                            "restore".into(),
-                            "--staged".into(),
-                            "--".into(),
-                            path.clone(),
-                        ]);
-                    }
-                    self.selected_file_staged = false;
-                }
-            } else {
-                if ui
-                    .add_enabled(!self.busy, egui::Button::new("Stage file"))
-                    .clicked()
-                {
-                    self.git_owned(vec!["add".into(), "--".into(), path.clone()]);
-                    self.selected_file_staged = true;
-                }
-                let tracked = self.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot
-                        .status
-                        .iter()
-                        .any(|file| file.path == path && file.index != '?')
-                });
-                if tracked
-                    && ui
-                        .add_enabled(!self.busy, egui::Button::new("Discard file..."))
+        ui.add_space(14.0);
+        egui::Frame::new()
+            .fill(panel())
+            .stroke(Stroke::new(1.0, border()))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("FILE").size(10.0).strong().color(muted()));
+                    let staged = self.selected_file_staged;
+                    if ui
+                        .add_enabled(
+                            !self.busy,
+                            egui::Button::new(if staged { "Unstage file" } else { "Stage file" })
+                                .fill(accent())
+                                .stroke(Stroke::NONE),
+                        )
                         .clicked()
-                {
-                    self.confirm_discard = Some(path.clone());
-                }
-            }
-            ui.separator();
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Diff view"))
-                .clicked()
-            {
-                let mut args = vec!["diff".into(), "--no-ext-diff".into(), "--no-color".into()];
-                if self.selected_file_staged {
-                    args.push("--cached".into());
-                }
-                args.extend(["--".into(), path.clone()]);
-                self.queue(Job::Inspect(args));
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("File view"))
-                .clicked()
-            {
-                if self.selected_file_staged {
-                    self.queue(Job::Inspect(vec!["show".into(), format!(":{path}")]));
-                } else {
-                    self.queue(Job::InspectFile(path.clone()));
-                }
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("File history"))
-                .clicked()
-            {
-                self.queue(Job::FileHistory(path.clone()));
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Blame"))
-                .clicked()
-            {
-                self.queue(Job::Inspect(vec![
-                    "blame".into(),
-                    "--".into(),
-                    path.clone(),
-                ]));
-            }
-            if ui
-                .add_enabled(!self.busy, egui::Button::new("Export patch..."))
-                .clicked()
-                && let Some(destination) = rfd::FileDialog::new()
-                    .set_file_name("changes.patch")
-                    .save_file()
-            {
-                let mut args = vec![
-                    "diff".into(),
-                    "--binary".into(),
-                    "--no-ext-diff".into(),
-                    "--no-color".into(),
-                ];
-                if self.selected_file_staged {
-                    args.push("--cached".into());
-                }
-                args.extend(["--".into(), path.clone()]);
-                self.queue(Job::ExportPatch(args, destination));
-            }
-        });
-        let hunk_count = git::diff_hunks(&self.detail).len();
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.diff_split, false, "Unified");
-            ui.selectable_value(&mut self.diff_split, true, "Side by side");
-            ui.checkbox(&mut self.diff_syntax, "Syntax colors");
-            ui.add_enabled_ui(!self.diff_split, |ui| {
-                ui.checkbox(&mut self.diff_wrap, "Wrap lines");
-            });
-            if hunk_count > 0 {
+                    {
+                        self.stage_file_paths(vec![path.clone()], staged);
+                        self.selected_file_staged = !staged;
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Edit in default app"))
+                        .on_hover_text("Open the working file in its default editor")
+                        .clicked()
+                    {
+                        let result = self
+                            .repo
+                            .as_ref()
+                            .ok_or("No repository selected".to_owned())
+                            .and_then(|repo| external::edit_file(repo, &path));
+                        if let Err(error) = result {
+                            self.error = error;
+                        }
+                    }
+                    let tracked = self.snapshot.as_ref().is_some_and(|snapshot| {
+                        snapshot
+                            .status
+                            .iter()
+                            .any(|file| file.path == path && file.index != '?')
+                    });
+                    if !staged
+                        && tracked
+                        && ui
+                            .add_enabled(!self.busy, egui::Button::new("Discard file..."))
+                            .clicked()
+                    {
+                        self.confirm_discard = Some(vec![path.clone()]);
+                    }
+                });
+                ui.add_space(6.0);
                 ui.separator();
-                if ui
-                    .add_enabled(
-                        self.diff_hunk_focus > 0,
-                        egui::Button::new("↑ Previous change"),
-                    )
-                    .clicked()
-                {
-                    self.diff_hunk_focus -= 1;
-                    self.diff_scroll_pending = true;
-                }
-                ui.label(format!(
-                    "{} / {}",
-                    self.diff_hunk_focus.min(hunk_count - 1) + 1,
-                    hunk_count
-                ));
-                if ui
-                    .add_enabled(
-                        self.diff_hunk_focus + 1 < hunk_count,
-                        egui::Button::new("Next change ↓"),
-                    )
-                    .clicked()
-                {
-                    self.diff_hunk_focus += 1;
-                    self.diff_scroll_pending = true;
-                }
-            }
-        });
-        ui.add_space(12.0);
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("INSPECT").size(10.0).strong().color(muted()));
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Diff view"))
+                        .clicked()
+                    {
+                        let mut args =
+                            vec!["diff".into(), "--no-ext-diff".into(), "--no-color".into()];
+                        if self.selected_file_staged {
+                            args.push("--cached".into());
+                        }
+                        args.extend(["--".into(), path.clone()]);
+                        self.queue(Job::Inspect(args));
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("File view"))
+                        .clicked()
+                    {
+                        if self.selected_file_staged {
+                            self.queue(Job::Inspect(vec!["show".into(), format!(":{path}")]));
+                        } else {
+                            self.queue(Job::InspectFile(path.clone()));
+                        }
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("File history"))
+                        .clicked()
+                    {
+                        self.queue(Job::FileHistory(path.clone()));
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Blame"))
+                        .clicked()
+                    {
+                        self.queue(Job::Inspect(vec![
+                            "blame".into(),
+                            "--".into(),
+                            path.clone(),
+                        ]));
+                    }
+                    if ui
+                        .add_enabled(!self.busy, egui::Button::new("Export patch..."))
+                        .clicked()
+                        && let Some(destination) = rfd::FileDialog::new()
+                            .set_file_name("changes.patch")
+                            .save_file()
+                    {
+                        let mut args = vec![
+                            "diff".into(),
+                            "--binary".into(),
+                            "--no-ext-diff".into(),
+                            "--no-color".into(),
+                        ];
+                        if self.selected_file_staged {
+                            args.push("--cached".into());
+                        }
+                        args.extend(["--".into(), path.clone()]);
+                        self.queue(Job::ExportPatch(args, destination));
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let hunk_count = git::diff_hunks(&self.detail).len();
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("DISPLAY").size(10.0).strong().color(muted()));
+                    ui.selectable_value(&mut self.diff_split, false, "Unified");
+                    ui.selectable_value(&mut self.diff_split, true, "Side by side");
+                    ui.checkbox(&mut self.diff_syntax, "Syntax colors");
+                    ui.add_enabled_ui(!self.diff_split, |ui| {
+                        ui.checkbox(&mut self.diff_wrap, "Wrap lines");
+                    });
+                    if hunk_count > 0 {
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                self.diff_hunk_focus > 0,
+                                egui::Button::new("↑ Previous change"),
+                            )
+                            .clicked()
+                        {
+                            self.diff_hunk_focus -= 1;
+                            self.diff_scroll_pending = true;
+                        }
+                        ui.label(format!(
+                            "{} / {}",
+                            self.diff_hunk_focus.min(hunk_count - 1) + 1,
+                            hunk_count
+                        ));
+                        if ui
+                            .add_enabled(
+                                self.diff_hunk_focus + 1 < hunk_count,
+                                egui::Button::new("Next change ↓"),
+                            )
+                            .clicked()
+                        {
+                            self.diff_hunk_focus += 1;
+                            self.diff_scroll_pending = true;
+                        }
+                    }
+                });
+            });
+        ui.add_space(18.0);
         if self.file_history_path.as_deref() == Some(&path) {
             ui.label(
                 RichText::new(format!(
@@ -5381,24 +5914,49 @@ impl GitVibe {
                     .as_ref()
                     .map_or(0, |snapshot| snapshot.status.len());
                 if change_count > 0 {
-                    egui::Frame::new()
-                        .fill(elevated())
-                        .inner_margin(egui::Margin::symmetric(9, 6))
+                    let card = egui::Frame::new()
+                        .fill(panel_alt())
+                        .stroke(Stroke::new(1.0, border()))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(12, 9))
                         .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{change_count} file changes in working directory"
-                                    ))
-                                    .size(11.0)
-                                    .color(text()),
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new("WORKING TREE")
+                                            .size(10.0)
+                                            .strong()
+                                            .color(orange()),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{change_count} changed {}",
+                                            if change_count == 1 { "file" } else { "files" }
+                                        ))
+                                        .size(11.5)
+                                        .color(text()),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Review changes").clicked() {
+                                            self.page = Page::Changes;
+                                        }
+                                    },
                                 );
-                                if ui.small_button("View changes").clicked() {
-                                    self.page = Page::Changes;
-                                }
                             });
                         });
-                    ui.add_space(7.0);
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            card.response.rect.left_top(),
+                            egui::vec2(3.0, card.response.rect.height()),
+                        ),
+                        0.0,
+                        orange(),
+                    );
+                    ui.add_space(10.0);
                 }
                 ui.label(
                     RichText::new(format!("commit: {}", commit.short))
@@ -6543,25 +7101,30 @@ impl GitVibe {
                     });
                 });
         }
-        if let Some(path) = self.confirm_discard.clone() {
+        if let Some(paths) = self.confirm_discard.clone() {
             egui::Window::new("Discard changes?")
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "Discard unstaged edits to {path}? This cannot be undone."
-                    ));
+                    ui.label(if paths.len() == 1 {
+                        format!(
+                            "Discard unstaged edits to {}? This cannot be undone.",
+                            paths[0]
+                        )
+                    } else {
+                        format!(
+                            "Discard unstaged edits to {} files? This cannot be undone.",
+                            paths.len()
+                        )
+                    });
                     ui.horizontal(|ui| {
                         if ui.button("Cancel").clicked() {
                             self.confirm_discard = None;
                         }
                         if ui.add(egui::Button::new("Discard").fill(red())).clicked() {
-                            self.git_owned(vec![
-                                "restore".into(),
-                                "--worktree".into(),
-                                "--".into(),
-                                path,
-                            ]);
+                            let mut args = vec!["restore".into(), "--worktree".into(), "--".into()];
+                            args.extend(paths);
+                            self.git_owned(args);
                             self.confirm_discard = None;
                         }
                     });
@@ -6878,6 +7441,9 @@ impl eframe::App for GitVibe {
         eframe::set_value(storage, "changelog_open", &self.changelog_open);
         eframe::set_value(storage, "theme_choice", &self.theme_choice);
         eframe::set_value(storage, "pull_mode", &self.pull_mode);
+        eframe::set_value(storage, "profiles", &self.profiles);
+        eframe::set_value(storage, "active_profile", &self.active_profile);
+        eframe::set_value(storage, "sync_global_profile", &self.sync_global_profile);
         eframe::set_value(storage, "merge_targets", &self.merge_targets);
         eframe::set_value(storage, "diff_syntax", &self.diff_syntax);
     }
@@ -7065,7 +7631,7 @@ impl eframe::App for GitVibe {
             .show(ui, |ui| self.workspace_tabs(ui));
         let repository_view = !matches!(
             self.page,
-            Page::Repositories | Page::Changelog | Page::NewTab
+            Page::Repositories | Page::Changelog | Page::NewTab | Page::Preferences
         );
         if repository_view {
             egui::Panel::top("top")
@@ -7192,9 +7758,11 @@ impl eframe::App for GitVibe {
                 Page::PullRequests => self.pull_request_page(ui),
                 Page::Console => self.console(ui),
                 Page::Updates => self.updates_page(ui),
+                Page::Preferences => self.preferences_page(ui),
             });
         self.command_palette(&ctx);
         self.dialogs(&ctx);
+        self.first_launch_profile_dialog(&ctx);
         if self.page == Page::Changes
             && !self.busy
             && self.pending.is_none()
@@ -7761,7 +8329,13 @@ fn workspace_tab(
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title)
     });
-    let fill = if selected { bg() } else { panel_alt() };
+    let fill = if response.hovered() {
+        if selected { panel_alt() } else { elevated() }
+    } else if selected {
+        bg()
+    } else {
+        panel_alt()
+    };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().line_segment(
         [rect.right_top(), rect.right_bottom()],
@@ -7915,19 +8489,34 @@ fn toolbar_button_with_corner(
     compact: bool,
     corners: egui::CornerRadius,
 ) -> egui::Response {
-    let button_text = if compact {
-        String::new()
+    let text_width = if compact {
+        0.0
     } else {
-        format!("    {label}")
+        ui.painter()
+            .layout_no_wrap(label.to_owned(), egui::FontId::proportional(11.5), text())
+            .size()
+            .x
     };
     let response = ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(button_text).size(11.5))
-            .min_size(egui::vec2(if compact { 30.0 } else { 0.0 }, 28.0))
+        egui::Button::new("")
+            .min_size(egui::vec2(
+                if compact { 30.0 } else { text_width + 36.0 },
+                28.0,
+            ))
             .corner_radius(corners),
     );
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let color = if enabled { text() } else { muted() };
+    if !compact {
+        ui.painter().text(
+            egui::pos2(response.rect.left() + 26.0, response.rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(11.5),
+            color,
+        );
+    }
     let c = egui::pos2(
         if compact {
             response.rect.center().x

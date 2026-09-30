@@ -5,6 +5,7 @@ mod external;
 mod git;
 mod github;
 mod logging;
+mod profiles;
 mod syntax;
 mod updates;
 
