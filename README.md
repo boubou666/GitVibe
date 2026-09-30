@@ -5,23 +5,29 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 ## Current features
 
 - Open, initialize, and clone repositories, including local and authenticated remote URLs. Cloning supports shallow history and sparse checkout.
+- Create, open, lock, unlock, and remove Git worktrees. A commit can be used as the starting point for a new worktree.
+- Add, initialize, update, sync, and open submodules, including those that store their Git metadata outside the working tree.
 - Keep multiple repositories open in tabs, pin favorites, search recent repositories, and restore window placement. The Changelog tab can be closed and reopened from the `+` menu.
 - Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
 - Right-click a commit for checkout, branch and tag creation, reset, cherry-pick, revert, comparisons, and SHA copying. Commit patches open in the center pane.
 - Review numbered diffs with highlighted edits; stage or unstage files, individual text hunks, or lines; discard edits and commit changes.
+- Export a commit or changed file as a patch and apply a patch from disk.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.
 - Cherry-pick and revert non-merge commits with confirmation.
 - Create and switch branches, track remote branches, merge branches, and create tags.
+- Add and remove remotes and create annotated tags.
+- Rebase the current branch onto another ref with conflict continuation, skip, and abort controls.
+- List and create GitHub pull requests when the GitHub CLI (`gh`) is installed and signed in.
 - Delete merged local branches and local tags with confirmation; reset HEAD using soft, mixed, or hard mode.
 - Fetch, pull, and push using your normal Git credential helper.
 - Create, inspect, apply, and pop stashes.
 - Run PowerShell commands on Windows or shell commands on Linux and macOS from a docked terminal with command history and working directory navigation.
 - Drag a repository folder onto the window to open it.
 
-The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts.
+The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The Rebase page does not yet offer interactive commit reorder, squash, reword, or drop. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts. Press Ctrl/Cmd+F to search commits and F5 to refresh the repository.
 
 ## Download and run
 
@@ -64,7 +70,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes an interactive rebase editor, worktree and submodule management, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes an interactive rebase editor, fuller diff modes, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

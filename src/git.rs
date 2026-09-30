@@ -16,7 +16,28 @@ pub struct Snapshot {
     pub tags: Vec<Ref>,
     pub remotes: Vec<String>,
     pub stashes: Vec<String>,
+    pub worktrees: Vec<Worktree>,
+    pub submodules: Vec<Submodule>,
     pub merge_in_progress: bool,
+    pub rebase_in_progress: bool,
+}
+
+#[derive(Clone)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    pub current: bool,
+    pub locked: bool,
+    pub prunable: bool,
+}
+
+#[derive(Clone)]
+pub struct Submodule {
+    pub name: String,
+    pub path: String,
+    pub url: String,
+    pub initialized: bool,
 }
 
 #[derive(Clone)]
@@ -495,6 +516,19 @@ pub fn run_owned(repo: &Path, args: &[String]) -> Result<String, String> {
     run(repo, &refs)
 }
 
+pub fn export_patch(repo: &Path, args: &[String], destination: &Path) -> Result<String, String> {
+    let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = git_output(Some(repo), &refs)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    if output.stdout.is_empty() {
+        return Err("There are no patch changes to export".to_owned());
+    }
+    std::fs::write(destination, output.stdout).map_err(|error| error.to_string())?;
+    Ok(format!("Saved patch to {}", destination.display()))
+}
+
 pub fn discover(path: &Path) -> Result<PathBuf, String> {
     let output = git_output(Some(path), &["rev-parse", "--show-toplevel"])?;
     if !output.status.success() {
@@ -572,7 +606,20 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
         .lines()
         .map(str::to_owned)
         .collect();
+    let worktrees = worktrees(&root)?;
+    let submodules = submodules(&root)?;
     let merge_in_progress = run(&root, &["rev-parse", "--verify", "-q", "MERGE_HEAD"]).is_ok();
+    let rebase_in_progress = ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .filter_map(|name| run(&root, &["rev-parse", "--git-path", name]).ok())
+        .any(|path| {
+            let path = Path::new(&path);
+            if path.is_absolute() {
+                path.exists()
+            } else {
+                root.join(path).exists()
+            }
+        });
     Ok(Snapshot {
         root,
         branch,
@@ -584,8 +631,120 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
         tags,
         remotes,
         stashes,
+        worktrees,
+        submodules,
         merge_in_progress,
+        rebase_in_progress,
     })
+}
+
+pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
+    let output = git_output(Some(repo), &["worktree", "list", "--porcelain", "-z"])?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut result = Vec::new();
+    let mut current: Option<Worktree> = None;
+    for field in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+    {
+        let field = String::from_utf8_lossy(field);
+        if let Some(path) = field.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                result.push(worktree);
+            }
+            current = Some(Worktree {
+                path: PathBuf::from(path),
+                head: String::new(),
+                branch: None,
+                current: false,
+                locked: false,
+                prunable: false,
+            });
+        } else if let Some(worktree) = current.as_mut() {
+            if let Some(head) = field.strip_prefix("HEAD ") {
+                worktree.head = head.to_owned();
+            } else if let Some(branch) = field.strip_prefix("branch refs/heads/") {
+                worktree.branch = Some(branch.to_owned());
+            } else if field.starts_with("locked") {
+                worktree.locked = true;
+            } else if field.starts_with("prunable") {
+                worktree.prunable = true;
+            }
+        }
+    }
+    if let Some(worktree) = current {
+        result.push(worktree);
+    }
+    let canonical_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    for worktree in &mut result {
+        worktree.current = worktree
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.path.clone())
+            == canonical_repo;
+    }
+    Ok(result)
+}
+
+pub fn submodules(repo: &Path) -> Result<Vec<Submodule>, String> {
+    if !repo.join(".gitmodules").is_file() {
+        return Ok(Vec::new());
+    }
+    let output = git_output(
+        Some(repo),
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "--null",
+            "--get-regexp",
+            "^submodule\\..*\\.(path|url)$",
+        ],
+    )?;
+    if !output.status.success() {
+        if output.stdout.is_empty() && output.stderr.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    let mut entries = std::collections::BTreeMap::<String, (String, String)>::new();
+    for field in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|field| !field.is_empty())
+    {
+        let record = String::from_utf8_lossy(field);
+        let Some((key, value)) = record.split_once('\n') else {
+            continue;
+        };
+        let Some(key) = key.strip_prefix("submodule.") else {
+            continue;
+        };
+        if let Some(name) = key.strip_suffix(".path") {
+            entries.entry(name.to_owned()).or_default().0 = value.to_owned();
+        } else if let Some(name) = key.strip_suffix(".url") {
+            entries.entry(name.to_owned()).or_default().1 = value.to_owned();
+        }
+    }
+    Ok(entries
+        .into_iter()
+        .filter_map(|(name, (path, url))| {
+            if path.is_empty() {
+                None
+            } else {
+                let initialized = repo.join(&path).join(".git").exists();
+                Some(Submodule {
+                    name,
+                    path,
+                    url,
+                    initialized,
+                })
+            }
+        })
+        .collect())
 }
 
 fn status(repo: &Path) -> Result<Vec<FileStatus>, String> {
@@ -1001,6 +1160,262 @@ mod tests {
         );
         std::fs::remove_dir_all(sparse).unwrap();
         std::fs::remove_dir_all(cloned).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn lists_linked_worktrees_and_initialized_submodules() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("gitvibe-nested-{}-{unique}", std::process::id()));
+        let root = init(&base.join("parent")).unwrap();
+        std::fs::write(root.join("README.md"), "parent\n").unwrap();
+        run(&root, &["add", "README.md"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+
+        let linked = base.join("linked checkout");
+        run(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "linked-test",
+                &linked.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let listed = worktrees(&root).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|tree| tree.path.canonicalize().unwrap()
+            == linked.canonicalize().unwrap()
+            && tree.branch.as_deref() == Some("linked-test")));
+        assert_eq!(listed.iter().filter(|tree| tree.current).count(), 1);
+        assert!(linked.join(".git").is_file());
+
+        let child = init(&base.join("child source")).unwrap();
+        std::fs::write(root.join(".gitmodules"), "").unwrap();
+        assert!(submodules(&root).unwrap().is_empty());
+        std::fs::write(child.join("child.txt"), "child\n").unwrap();
+        run(&child, &["add", "child.txt"]).unwrap();
+        run(
+            &child,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Child",
+            ],
+        )
+        .unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child.to_string_lossy(),
+                "modules/child",
+            ],
+        )
+        .unwrap();
+        let modules = submodules(&root).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(modules[0].path, "modules/child");
+        assert!(modules[0].initialized);
+        assert!(root.join("modules/child/.git").is_file());
+
+        run(&root, &["worktree", "remove", &linked.to_string_lossy()]).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn detects_rebase_conflict_and_abort() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-rebase-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        let commit = |message: &str| {
+            run(&root, &["add", "note.txt"]).unwrap();
+            run(
+                &root,
+                &[
+                    "-c",
+                    "user.name=GitVibe Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-m",
+                    message,
+                ],
+            )
+            .unwrap();
+        };
+        std::fs::write(root.join("note.txt"), "base\n").unwrap();
+        commit("Base");
+        let main_branch = run(&root, &["branch", "--show-current"]).unwrap();
+        std::fs::write(root.join("note.txt"), "main\n").unwrap();
+        commit("Main edit");
+        run(&root, &["switch", "-c", "feature", "HEAD~1"]).unwrap();
+        std::fs::write(root.join("note.txt"), "feature\n").unwrap();
+        commit("Feature edit");
+        assert!(run(&root, &["rebase", &main_branch]).is_err());
+        assert!(snapshot(&root).unwrap().rebase_in_progress);
+        run(&root, &["rebase", "--abort"]).unwrap();
+        assert!(!snapshot(&root).unwrap().rebase_in_progress);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exports_and_applies_working_tree_patch() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-patch-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        let file = root.join("note.txt");
+        std::fs::write(&file, "before\n").unwrap();
+        run(&root, &["add", "note.txt"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Before",
+            ],
+        )
+        .unwrap();
+        std::fs::write(&file, "after\n").unwrap();
+        let patch = root.with_extension("patch");
+        export_patch(
+            &root,
+            &[
+                "diff".into(),
+                "--binary".into(),
+                "--".into(),
+                "note.txt".into(),
+            ],
+            &patch,
+        )
+        .unwrap();
+        assert!(
+            std::fs::read_to_string(&patch)
+                .unwrap()
+                .contains("diff --git")
+        );
+        run(&root, &["restore", "note.txt"]).unwrap();
+        run(&root, &["apply", "--", &patch.to_string_lossy()]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "after\n"
+        );
+        std::fs::remove_file(patch).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manages_remote_and_annotated_tag() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-remotes-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        run(&root, &["add", "README.md"]).unwrap();
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "Initial",
+            ],
+        )
+        .unwrap();
+        run(
+            &root,
+            &[
+                "remote",
+                "add",
+                "sample",
+                "https://example.invalid/sample.git",
+            ],
+        )
+        .unwrap();
+        assert!(
+            snapshot(&root)
+                .unwrap()
+                .remotes
+                .iter()
+                .any(|name| name == "sample")
+        );
+        run(
+            &root,
+            &[
+                "-c",
+                "user.name=GitVibe Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "tag",
+                "-a",
+                "v1",
+                "-m",
+                "Version one",
+            ],
+        )
+        .unwrap();
+        assert!(
+            snapshot(&root)
+                .unwrap()
+                .tags
+                .iter()
+                .any(|tag| tag.name == "v1")
+        );
+        run(&root, &["remote", "remove", "sample"]).unwrap();
+        assert!(
+            !snapshot(&root)
+                .unwrap()
+                .remotes
+                .iter()
+                .any(|name| name == "sample")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
