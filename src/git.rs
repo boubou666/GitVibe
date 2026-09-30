@@ -40,6 +40,42 @@ pub struct Submodule {
     pub initialized: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RebaseAction {
+    Pick,
+    Squash,
+    Reword,
+    Drop,
+}
+
+impl RebaseAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pick => "Pick",
+            Self::Squash => "Squash",
+            Self::Reword => "Reword",
+            Self::Drop => "Drop",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RebaseStep {
+    pub id: String,
+    pub subject: String,
+    pub message: String,
+    pub action: RebaseAction,
+}
+
+#[derive(Clone)]
+pub struct RebasePlan {
+    pub target: String,
+    pub target_id: String,
+    pub branch: String,
+    pub head: String,
+    pub steps: Vec<RebaseStep>,
+}
+
 #[derive(Clone)]
 pub struct FileStatus {
     pub index: char,
@@ -456,6 +492,34 @@ pub fn apply_line(repo: &Path, patch: &str, reverse: bool) -> Result<(), String>
     apply_patch(repo, patch, reverse, true)
 }
 
+pub fn discard_hunk(repo: &Path, patch: &str) -> Result<(), String> {
+    if diff_hunks(patch).len() != 1 {
+        return Err("Expected a single text hunk to discard".into());
+    }
+    let mut child = Command::new("git")
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(repo)
+        .args(["apply", "--reverse", "--whitespace=nowarn", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Could not start Git: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("Could not open Git input")?
+        .write_all(patch.as_bytes())
+        .map_err(|e| format!("Could not send patch to Git: {e}"))?;
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
 fn apply_patch(repo: &Path, patch: &str, reverse: bool, zero_context: bool) -> Result<(), String> {
     let mut command = Command::new("git");
     command.arg("--no-pager").arg("-C").arg(repo).arg("apply");
@@ -609,17 +673,7 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
     let worktrees = worktrees(&root)?;
     let submodules = submodules(&root)?;
     let merge_in_progress = run(&root, &["rev-parse", "--verify", "-q", "MERGE_HEAD"]).is_ok();
-    let rebase_in_progress = ["rebase-merge", "rebase-apply"]
-        .into_iter()
-        .filter_map(|name| run(&root, &["rev-parse", "--git-path", name]).ok())
-        .any(|path| {
-            let path = Path::new(&path);
-            if path.is_absolute() {
-                path.exists()
-            } else {
-                root.join(path).exists()
-            }
-        });
+    let rebase_in_progress = rebase_in_progress(&root);
     Ok(Snapshot {
         root,
         branch,
@@ -745,6 +799,278 @@ pub fn submodules(repo: &Path) -> Result<Vec<Submodule>, String> {
             }
         })
         .collect())
+}
+
+fn git_metadata_path(repo: &Path, name: &str) -> Result<PathBuf, String> {
+    let raw = run(repo, &["rev-parse", "--git-path", name])?;
+    let path = PathBuf::from(raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        repo.join(path)
+    })
+}
+
+pub fn rebase_in_progress(repo: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"]
+        .into_iter()
+        .filter_map(|name| git_metadata_path(repo, name).ok())
+        .any(|path| path.exists())
+}
+
+pub fn load_rebase_plan(repo: &Path, target: &str) -> Result<RebasePlan, String> {
+    let target = target.trim();
+    if target.is_empty() || target.starts_with('-') || target.contains(['\n', '\r']) {
+        return Err("Choose a branch, tag, or commit to rebase onto".into());
+    }
+    let target_id = run(
+        repo,
+        &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
+    )?;
+    run(repo, &["merge-base", &target_id, "HEAD"])
+        .map_err(|_| "The current branch and target have no common ancestor".to_owned())?;
+    let head = run(repo, &["rev-parse", "HEAD"])?;
+    let branch = run(repo, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        return Err("Check out a branch before planning an interactive rebase".into());
+    }
+    let range = format!("{target_id}..HEAD");
+    let ids = run(repo, &["rev-list", "--reverse", &range])?
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err("There are no commits to replay onto this target".into());
+    }
+    if ids.len() > 40 {
+        return Err(
+            "Interactive rebase is limited to 40 commits at a time. Choose a closer target.".into(),
+        );
+    }
+    if !run(repo, &["rev-list", "--merges", &range])?.is_empty() {
+        return Err("This commit range contains a merge commit. Choose a linear range.".into());
+    }
+    let mut steps = Vec::with_capacity(ids.len());
+    for id in ids {
+        let subject = run(repo, &["show", "-s", "--format=%s", &id])?;
+        let message = run(repo, &["show", "-s", "--format=%B", &id])?;
+        steps.push(RebaseStep {
+            id,
+            subject,
+            message,
+            action: RebaseAction::Pick,
+        });
+    }
+    Ok(RebasePlan {
+        target: target.to_owned(),
+        target_id,
+        branch,
+        head,
+        steps,
+    })
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn render_rebase_todo(
+    plan: &RebasePlan,
+    executable: &Path,
+    state_dir: &Path,
+) -> Result<String, String> {
+    if plan.steps.is_empty()
+        || plan
+            .steps
+            .iter()
+            .all(|step| step.action == RebaseAction::Drop)
+    {
+        return Err("Keep at least one commit in the interactive rebase".into());
+    }
+    if plan
+        .steps
+        .iter()
+        .find(|step| step.action != RebaseAction::Drop)
+        .is_some_and(|step| step.action == RebaseAction::Squash)
+    {
+        return Err("The first kept commit cannot be squashed".into());
+    }
+    if plan
+        .steps
+        .iter()
+        .any(|step| step.action == RebaseAction::Reword && step.message.trim().is_empty())
+    {
+        return Err("Reworded commits need a message".into());
+    }
+    let mut todo = String::new();
+    for (index, step) in plan.steps.iter().enumerate() {
+        let command = match step.action {
+            RebaseAction::Pick | RebaseAction::Reword => "pick",
+            RebaseAction::Squash => "squash",
+            RebaseAction::Drop => "drop",
+        };
+        let subject = step.subject.replace(['\n', '\r'], " ");
+        todo.push_str(&format!("{command} {} {subject}\n", step.id));
+        if step.action == RebaseAction::Reword {
+            let message_path = state_dir.join(format!("message-{index}.txt"));
+            todo.push_str(&format!(
+                "exec {} --amend-rebase-message {}\n",
+                shell_quote_path(executable),
+                shell_quote_path(&message_path)
+            ));
+        }
+    }
+    Ok(todo)
+}
+
+fn interactive_rebase_state_dir(repo: &Path) -> Result<PathBuf, String> {
+    git_metadata_path(repo, "gitvibe-interactive-rebase")
+}
+
+pub fn cleanup_interactive_rebase(repo: &Path) -> Result<(), String> {
+    let directory = interactive_rebase_state_dir(repo)?;
+    if directory.join("gitvibe-state-v1").is_file() {
+        std::fs::remove_dir_all(directory).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn start_interactive_rebase(repo: &Path, plan: &RebasePlan) -> Result<String, String> {
+    if rebase_in_progress(repo) {
+        return Err("Finish or abort the current rebase first".into());
+    }
+    if !status(repo)?.is_empty() {
+        return Err("Commit or stash local changes before starting interactive rebase".into());
+    }
+    if run(repo, &["branch", "--show-current"])? != plan.branch {
+        return Err("The branch changed. Reload the rebase plan.".into());
+    }
+    if run(repo, &["rev-parse", "HEAD"])? != plan.head
+        || run(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("{}^{{commit}}", plan.target),
+            ],
+        )? != plan.target_id
+    {
+        return Err("The branch or target changed. Reload the rebase plan.".into());
+    }
+    let range = format!("{}..HEAD", plan.target_id);
+    let current = run(repo, &["rev-list", "--reverse", &range])?
+        .lines()
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let planned = plan
+        .steps
+        .iter()
+        .map(|step| step.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if current != planned || plan.steps.len() != current.len() {
+        return Err("The commit range changed. Reload the rebase plan.".into());
+    }
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let state_dir = interactive_rebase_state_dir(repo)?;
+    if state_dir.exists() {
+        if !state_dir.join("gitvibe-state-v1").is_file() {
+            return Err(format!(
+                "Rebase state path is already in use: {}",
+                state_dir.display()
+            ));
+        }
+        cleanup_interactive_rebase(repo)?;
+    }
+    std::fs::create_dir_all(&state_dir).map_err(|error| error.to_string())?;
+    std::fs::write(
+        state_dir.join("gitvibe-state-v1"),
+        "GitVibe interactive rebase state v1\n",
+    )
+    .map_err(|error| error.to_string())?;
+    for (index, step) in plan.steps.iter().enumerate() {
+        if step.action == RebaseAction::Reword {
+            std::fs::write(
+                state_dir.join(format!("message-{index}.txt")),
+                &step.message,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
+    let todo = render_rebase_todo(plan, &executable, &state_dir)?;
+    let todo_path = state_dir.join("todo");
+    std::fs::write(&todo_path, todo).map_err(|error| error.to_string())?;
+    let editor = format!(
+        "{} --copy-rebase-todo {}",
+        shell_quote_path(&executable),
+        shell_quote_path(&todo_path)
+    );
+    let output = Command::new("git")
+        .arg("--no-pager")
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "rebase",
+            "--interactive",
+            "--no-autosquash",
+            &plan.target_id,
+        ])
+        .env("GIT_SEQUENCE_EDITOR", editor)
+        .env("GIT_EDITOR", "true")
+        .output()
+        .map_err(|error| format!("Could not start Git: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if !rebase_in_progress(repo) {
+        let _ = cleanup_interactive_rebase(repo);
+    }
+    if output.status.success() {
+        Ok(if stdout.is_empty() {
+            "Interactive rebase complete".into()
+        } else {
+            stdout
+        })
+    } else {
+        Err(if stderr.is_empty() { stdout } else { stderr })
+    }
+}
+
+pub fn run_helper_command() -> Option<i32> {
+    let mut arguments = std::env::args_os().skip(1);
+    let command = arguments.next()?;
+    let result = if command == "--copy-rebase-todo" {
+        match (arguments.next(), arguments.next(), arguments.next()) {
+            (Some(source), Some(destination), None) => std::fs::copy(source, destination)
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => Err("Expected a source and destination todo path".into()),
+        }
+    } else if command == "--amend-rebase-message" {
+        match (arguments.next(), arguments.next()) {
+            (Some(message), None) => Command::new("git")
+                .args(["commit", "--amend", "-F"])
+                .arg(message)
+                .output()
+                .map_err(|error| error.to_string())
+                .and_then(|output| {
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                    }
+                }),
+            _ => Err("Expected a commit message file".into()),
+        }
+    } else {
+        return None;
+    };
+    Some(match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    })
 }
 
 fn status(repo: &Path) -> Result<Vec<FileStatus>, String> {
@@ -1712,6 +2038,93 @@ mod tests {
         let resolved = snapshot(&root).unwrap();
         assert!(!resolved.status.iter().any(FileStatus::conflicted));
         assert!(resolved.status.iter().any(FileStatus::staged));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn builds_interactive_rebase_todo_for_linked_worktree() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("gitvibe-plan-{}-{unique}", std::process::id()));
+        let root = init(&base.join("main")).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        std::fs::write(root.join("note.txt"), "base\n").unwrap();
+        run(&root, &["add", "note.txt"]).unwrap();
+        run(&root, &["commit", "-m", "Base"]).unwrap();
+        let linked = base.join("linked");
+        run(
+            &root,
+            &["worktree", "add", "-b", "topic", &linked.to_string_lossy()],
+        )
+        .unwrap();
+        assert!(linked.join(".git").is_file());
+        for (number, name) in [(1, "First"), (2, "Second"), (3, "Third")] {
+            std::fs::write(linked.join(format!("{number}.txt")), name).unwrap();
+            run(&linked, &["add", "."]).unwrap();
+            run(&linked, &["commit", "-m", name]).unwrap();
+        }
+        let mut plan = load_rebase_plan(&linked, "HEAD~3").unwrap();
+        assert_eq!(
+            plan.steps
+                .iter()
+                .map(|step| step.subject.as_str())
+                .collect::<Vec<_>>(),
+            vec!["First", "Second", "Third"]
+        );
+        plan.steps.swap(1, 2);
+        plan.steps[1].action = RebaseAction::Reword;
+        plan.steps[1].message = "Updated third\n".into();
+        plan.steps[2].action = RebaseAction::Squash;
+        let state = interactive_rebase_state_dir(&linked).unwrap();
+        let todo = render_rebase_todo(&plan, Path::new("/gitvibe"), &state).unwrap();
+        let commands = todo.lines().collect::<Vec<_>>();
+        assert!(commands[0].starts_with(&format!("pick {} First", plan.steps[0].id)));
+        assert!(commands[1].starts_with(&format!("pick {} Third", plan.steps[1].id)));
+        assert!(commands[2].contains("--amend-rebase-message"));
+        assert!(commands[3].starts_with(&format!("squash {} Second", plan.steps[2].id)));
+        plan.steps[0].action = RebaseAction::Drop;
+        plan.steps[1].action = RebaseAction::Squash;
+        assert!(render_rebase_todo(&plan, Path::new("/gitvibe"), &state).is_err());
+        run(&root, &["worktree", "remove", &linked.to_string_lossy()]).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn discards_one_unstaged_hunk_without_touching_another() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gitvibe-discard-hunk-{}-{unique}",
+            std::process::id()
+        ));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        let original = (1..=30).map(|i| format!("line {i}\n")).collect::<String>();
+        std::fs::write(root.join("file.txt"), &original).unwrap();
+        run(&root, &["add", "file.txt"]).unwrap();
+        run(&root, &["commit", "-m", "Base"]).unwrap();
+        let changed = original
+            .replace("line 2\n", "changed 2\n")
+            .replace("line 28\n", "changed 28\n");
+        std::fs::write(root.join("file.txt"), changed).unwrap();
+        let patch = run(&root, &["diff", "--", "file.txt"]).unwrap();
+        let hunks = diff_hunks(&patch);
+        assert_eq!(hunks.len(), 2);
+        discard_hunk(&root, &hunks[0].patch).unwrap();
+        let remaining = std::fs::read_to_string(root.join("file.txt")).unwrap();
+        assert!(remaining.lines().any(|line| line == "line 2"));
+        assert!(remaining.lines().any(|line| line == "changed 28"));
+        assert_eq!(
+            diff_hunks(&run(&root, &["diff", "--", "file.txt"]).unwrap()).len(),
+            1
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
