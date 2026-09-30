@@ -166,6 +166,7 @@ enum Page {
     Stashes,
     Worktrees,
     Submodules,
+    Lfs,
     Rebase,
     PullRequests,
     Console,
@@ -226,6 +227,7 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ("Branches and tags", PaletteAction::Show(Page::Branches)),
     ("Worktrees", PaletteAction::Show(Page::Worktrees)),
     ("Submodules", PaletteAction::Show(Page::Submodules)),
+    ("Git LFS", PaletteAction::Show(Page::Lfs)),
     ("Rebase", PaletteAction::Show(Page::Rebase)),
     ("Stashes", PaletteAction::Show(Page::Stashes)),
     ("Pull requests", PaletteAction::Show(Page::PullRequests)),
@@ -319,6 +321,7 @@ enum Job {
     Run(Vec<String>),
     UndoIndex(git::IndexChange, bool),
     CheckMergeTarget(String),
+    LoadLfs,
     SwitchBranch(String, bool, bool),
     Shell(String, PathBuf),
     LoadPullRequests,
@@ -354,6 +357,7 @@ enum Done {
     IndexChanged(String, Snapshot, Option<git::IndexChange>),
     IndexMoved(String, Snapshot, git::IndexChange, bool),
     MergeChecked(Result<git::MergeCheck, String>),
+    LfsLoaded(Result<Option<git::LfsStatus>, String>),
     Shell(Result<String, String>),
     PullRequests(Result<Vec<github::PullRequest>, String>),
     PullRequestCreated(Result<String, String>),
@@ -416,12 +420,17 @@ pub struct GitVibe {
     worktree_ref: String,
     submodule_url: String,
     submodule_path: String,
+    lfs_pattern: String,
+    lfs_status: Option<git::LfsStatus>,
+    lfs_loaded_for: Option<PathBuf>,
+    lfs_error: String,
     rebase_onto: String,
     rebase_autostash: bool,
     interactive_plan: Option<git::RebasePlan>,
     confirm_interactive_rebase: bool,
     diff_wrap: bool,
     diff_split: bool,
+    diff_syntax: bool,
     diff_hunk_focus: usize,
     diff_scroll_pending: bool,
     file_scroll_pending: bool,
@@ -648,12 +657,20 @@ impl GitVibe {
             worktree_ref: "HEAD".to_owned(),
             submodule_url: String::new(),
             submodule_path: String::new(),
+            lfs_pattern: String::new(),
+            lfs_status: None,
+            lfs_loaded_for: None,
+            lfs_error: String::new(),
             rebase_onto: String::new(),
             rebase_autostash: false,
             interactive_plan: None,
             confirm_interactive_rebase: false,
             diff_wrap: false,
             diff_split: false,
+            diff_syntax: cc
+                .storage
+                .and_then(|storage| eframe::get_value::<bool>(storage, "diff_syntax"))
+                .unwrap_or(true),
             diff_hunk_focus: 0,
             diff_scroll_pending: false,
             file_scroll_pending: false,
@@ -895,6 +912,10 @@ impl GitVibe {
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|path| git::check_merge_target(&path, &target)),
                 ),
+                Job::LoadLfs => Done::LfsLoaded(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|path| git::lfs_status(&path)),
+                ),
                 Job::SwitchBranch(name, stash_first, remote) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
                         let mut output = String::new();
@@ -1065,6 +1086,9 @@ impl GitVibe {
                     self.merge_check = None;
                     self.merge_check_error.clear();
                     if self.repo.as_ref() != Some(&snapshot.root) {
+                        self.lfs_status = None;
+                        self.lfs_loaded_for = None;
+                        self.lfs_error.clear();
                         self.undo_stack.clear();
                         self.redo_stack.clear();
                         self.terminal_cwd = Some(snapshot.root.clone());
@@ -1111,6 +1135,9 @@ impl GitVibe {
             },
             Done::Ran(result) => match result {
                 Ok((output, snapshot)) => {
+                    if self.page == Page::Lfs {
+                        self.lfs_loaded_for = None;
+                    }
                     self.merge_check = None;
                     self.merge_check_error.clear();
                     if !keep_index_history {
@@ -1200,6 +1227,9 @@ impl GitVibe {
                 }
             },
             Done::RanFailed(error, snapshot) => {
+                if self.page == Page::Lfs {
+                    self.lfs_loaded_for = None;
+                }
                 self.merge_check = None;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
@@ -1311,6 +1341,16 @@ impl GitVibe {
                     self.merge_check = None;
                     self.merge_check_error = error.clone();
                     self.error = error;
+                }
+            },
+            Done::LfsLoaded(result) => match result {
+                Ok(status) => {
+                    self.lfs_status = status;
+                    self.lfs_error.clear();
+                }
+                Err(error) => {
+                    self.lfs_status = None;
+                    self.lfs_error = error;
                 }
             },
             Done::IndexChanged(..) | Done::IndexMoved(..) => unreachable!(),
@@ -2347,6 +2387,7 @@ impl GitVibe {
             (Page::Stashes, "Stashes"),
             (Page::Worktrees, "Worktrees"),
             (Page::Submodules, "Submodules"),
+            (Page::Lfs, "Git LFS"),
             (Page::Rebase, "Rebase"),
             (Page::PullRequests, "Pull requests"),
             (Page::Console, "Terminal"),
@@ -2839,6 +2880,7 @@ impl GitVibe {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.diff_split, false, "Unified");
             ui.selectable_value(&mut self.diff_split, true, "Side by side");
+            ui.checkbox(&mut self.diff_syntax, "Syntax colors");
         });
         if self.detail.is_empty() {
             ui.label(RichText::new("Loading commit diff...").color(muted()));
@@ -3702,6 +3744,146 @@ impl GitVibe {
                 .clicked()
             {
                 self.git(&["worktree", "prune"]);
+            }
+        });
+    }
+
+    fn lfs_page(&mut self, ui: &mut egui::Ui) {
+        section_title(
+            ui,
+            "LARGE FILES",
+            "Git LFS",
+            "See large-file rules and objects in this checkout.",
+        );
+        ui.add_space(14.0);
+        let Some(repo) = self.snapshot.as_ref().map(|snapshot| snapshot.root.clone()) else {
+            self.empty(ui);
+            return;
+        };
+        if self.lfs_loaded_for.as_ref() != Some(&repo) && !self.busy {
+            self.lfs_loaded_for = Some(repo);
+            self.queue(Job::LoadLfs);
+        }
+        if ui
+            .add_enabled(!self.busy, egui::Button::new("Refresh LFS status"))
+            .clicked()
+        {
+            self.lfs_loaded_for = None;
+        }
+        if !self.lfs_error.is_empty() {
+            ui.colored_label(red(), &self.lfs_error);
+        }
+        let Some(status) = self.lfs_status.clone() else {
+            let loading = self.busy || matches!(self.pending, Some(Job::LoadLfs));
+            if self.lfs_loaded_for.is_some() && !loading && self.lfs_error.is_empty() {
+                ui.label("Git LFS is not installed. Install Git LFS and refresh this page.");
+            } else if self.lfs_error.is_empty() {
+                ui.label("Loading Git LFS status…");
+            }
+            return;
+        };
+        ui.label(RichText::new(status.version).small().color(muted()));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.busy,
+                    egui::Button::new("Initialize in this repository"),
+                )
+                .on_hover_text("Install Git LFS filters and hooks in this repository only")
+                .clicked()
+            {
+                self.git(&["lfs", "install", "--local"]);
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !status.files.is_empty(),
+                    egui::Button::new("Pull LFS objects"),
+                )
+                .on_hover_text("Download LFS objects for the current checkout")
+                .clicked()
+            {
+                self.git(&["lfs", "pull"]);
+            }
+        });
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new(format!("TRACKED PATTERNS  |  {}", status.patterns.len()))
+                .small()
+                .strong()
+                .color(muted()),
+        );
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.lfs_pattern)
+                    .hint_text("Example: *.psd")
+                    .desired_width(260.0),
+            );
+            let pattern = self.lfs_pattern.trim();
+            let valid = !pattern.is_empty()
+                && !pattern.starts_with('-')
+                && !pattern.chars().any(char::is_control);
+            if ui
+                .add_enabled(!self.busy && valid, egui::Button::new("Track pattern"))
+                .clicked()
+            {
+                let pattern = pattern.to_owned();
+                self.lfs_pattern.clear();
+                self.git_owned(vec!["lfs".into(), "track".into(), pattern]);
+            }
+        });
+        ui.label(RichText::new("Tracking updates .gitattributes. Review and commit that file with your changes. Existing history is not converted.").small().color(muted()));
+        for pattern in status.patterns {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(&pattern.pattern).strong());
+                if pattern.lockable {
+                    badge(ui, "LOCKABLE", violet());
+                }
+                if !pattern.tracked {
+                    badge(ui, "EXCLUDED", orange());
+                }
+                ui.label(RichText::new(&pattern.source).small().color(muted()));
+                if pattern.tracked
+                    && pattern.source == ".gitattributes"
+                    && !pattern.pattern.starts_with('-')
+                    && ui
+                        .add_enabled(!self.busy, egui::Button::new("Untrack"))
+                        .on_hover_text("Remove this rule from the repository .gitattributes")
+                        .clicked()
+                {
+                    self.git_owned(vec!["lfs".into(), "untrack".into(), pattern.pattern]);
+                }
+            });
+        }
+        ui.add_space(18.0);
+        ui.label(
+            RichText::new(format!("LFS FILES IN CHECKOUT  |  {}", status.files.len()))
+                .small()
+                .strong()
+                .color(muted()),
+        );
+        if status.files.is_empty() {
+            ui.label(RichText::new("No LFS files in the current checkout.").color(muted()));
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for file in status.files {
+                ui.horizontal(|ui| {
+                    ui.label(&file.name);
+                    if let Some(size) = file.size {
+                        ui.label(
+                            RichText::new(format!("{size} bytes"))
+                                .small()
+                                .color(muted()),
+                        );
+                    }
+                    if !file.oid.is_empty() {
+                        ui.label(
+                            RichText::new(file.oid.chars().take(10).collect::<String>())
+                                .small()
+                                .color(muted()),
+                        );
+                    }
+                });
             }
         });
     }
@@ -4667,6 +4849,7 @@ impl GitVibe {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.diff_split, false, "Unified");
             ui.selectable_value(&mut self.diff_split, true, "Side by side");
+            ui.checkbox(&mut self.diff_syntax, "Syntax colors");
             ui.add_enabled_ui(!self.diff_split, |ui| {
                 ui.checkbox(&mut self.diff_wrap, "Wrap lines");
             });
@@ -5122,6 +5305,9 @@ impl GitVibe {
     }
 
     fn syntax_hunk(&mut self, path: &str, hunk: &git::DiffHunk) -> Arc<syntax::HunkColors> {
+        if !self.diff_syntax {
+            return Arc::new(syntax::HunkColors::default());
+        }
         if self.syntax_cache.len() > 80 {
             self.syntax_cache.clear();
         }
@@ -6219,6 +6405,7 @@ impl eframe::App for GitVibe {
         eframe::set_value(storage, "theme_choice", &self.theme_choice);
         eframe::set_value(storage, "pull_mode", &self.pull_mode);
         eframe::set_value(storage, "merge_targets", &self.merge_targets);
+        eframe::set_value(storage, "diff_syntax", &self.diff_syntax);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -6520,6 +6707,7 @@ impl eframe::App for GitVibe {
                 Page::Stashes => self.stashes(ui),
                 Page::Worktrees => self.worktree_page(ui),
                 Page::Submodules => self.submodule_page(ui),
+                Page::Lfs => self.lfs_page(ui),
                 Page::Rebase => self.rebase_page(ui),
                 Page::PullRequests => self.pull_request_page(ui),
                 Page::Console => self.console(ui),

@@ -50,13 +50,19 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 
 1. Local merge-target conflict checks for committed branch tips, with per-repository target selection and conflicting-file details. The check leaves the index and working tree untouched.
 
+## Completed in 0.14.0
+
+1. Git LFS status, local setup, pattern tracking and untracking, and pulling objects from the remote through the installed Git LFS extension.
+2. A persistent syntax-color switch in unified and side by side diff views.
+
 ## Next: GitKraken workflow parity
 
-1. **Diff review.** Add better state recovery across distant hunks and a syntax toggle for users who prefer plain text. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
+1. **Diff review.** Add better syntax parser state recovery across distant hunks. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
 2. **Broader undo and redo.** Extend explicit recovery data beyond staging to safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
 3. **Accessibility.** Continue reviewing focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
 4. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
-5. **More GitKraken workflows.** Add Git LFS status and tracking controls, commit templates and co-authors, and a confirmed way to restore a file from a selected commit. These appear in GitKraken's [LFS guide](https://help.gitkraken.com/gitkraken-desktop/git-lfs/) and [commit guide](https://help.gitkraken.com/gitkraken-desktop/commits/).
+5. **More GitKraken workflows.** Add commit templates and co-authors, and a confirmed way to restore a file from a selected commit. These appear in GitKraken's [commit guide](https://help.gitkraken.com/gitkraken-desktop/commits/).
+6. **Git LFS follow-up.** Add locked-file workflows and safe local-object pruning. Define how GitVibe should present LFS migration, which can rewrite existing history, before offering it in the UI. See GitKraken's [LFS guide](https://help.gitkraken.com/gitkraken-desktop/git-lfs/).
 
 ## Needs account or distribution decisions
 
