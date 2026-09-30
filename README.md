@@ -14,7 +14,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Open the local diagnostic log folder from Updates when reporting an app error or crash. Logs rotate at 2 MB, omit command arguments, and redact URL user credentials; review a log before sharing it because error messages may contain repository paths.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
 - Right-click a commit for checkout, branch and tag creation, reset, cherry-pick, revert, comparisons, and SHA copying. Commit patches open in the center pane.
-- Review numbered unified or side by side diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes. External working-tree edits appear automatically while a repository is open.
+- Review numbered unified or side by side diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes. Open a selected working-tree file in its default external editor. External working-tree edits appear automatically while a repository is open.
 - Export a commit or changed file as a patch and apply a patch from disk.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.

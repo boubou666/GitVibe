@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+    external,
     git::{self, Snapshot},
     github, logging, syntax, updates,
 };
@@ -1806,7 +1807,10 @@ impl GitVibe {
                     }
                     _ => muted(),
                 };
-                let menu = ui.menu_button(RichText::new("◇").size(19.0).color(indicator), |ui| {
+                let (menu_response, _) = egui::containers::menu::MenuButton::from_button(
+                    egui::Button::new(" ").min_size(egui::vec2(28.0, 28.0)),
+                )
+                .ui(ui, |ui| {
                     ui.set_min_width(330.0);
                     ui.label(RichText::new("MERGE TARGET CHECK").strong().color(text()));
                     ui.label(
@@ -1818,7 +1822,7 @@ impl GitVibe {
                     );
                     ui.separator();
                     if let Some(target) = &merge_target {
-                        ui.label(format!("{} → {target}", snapshot.branch));
+                        ui.label(format!("{} to {target}", snapshot.branch));
                     } else {
                         ui.label("Choose a target branch to check.");
                     }
@@ -1887,21 +1891,31 @@ impl GitVibe {
                         self.queue(Job::CheckMergeTarget(target.clone()));
                     }
                 });
-                menu.response.widget_info(|| {
+                let center = menu_response.rect.center();
+                ui.painter().add(egui::Shape::closed_line(
+                    vec![
+                        egui::pos2(center.x, center.y - 6.0),
+                        egui::pos2(center.x + 6.0, center.y),
+                        egui::pos2(center.x, center.y + 6.0),
+                        egui::pos2(center.x - 6.0, center.y),
+                    ],
+                    Stroke::new(1.5, indicator),
+                ));
+                menu_response.widget_info(|| {
                     egui::WidgetInfo::labeled(
                         egui::WidgetType::Button,
                         true,
                         "Check target branch for merge conflicts",
                     )
                 });
-                menu.response.clone().on_hover_text(match &merge_check {
+                menu_response.clone().on_hover_text(match &merge_check {
                     Some(check) if check.clean => {
                         format!("No conflicts detected against {}", check.target)
                     }
                     Some(check) => format!("Conflicts detected against {}", check.target),
                     None => "Check the current branch against its merge target".into(),
                 });
-                if menu.response.clicked()
+                if menu_response.clicked()
                     && merge_check.is_none()
                     && !self.busy
                     && let Some(target) = merge_target
@@ -1921,14 +1935,13 @@ impl GitVibe {
                     .color(if count == 0 { accent() } else { orange() }),
                 );
             }
-            let toolbar_width = 665.0;
+            let toolbar_width = 820.0;
             ui.add_space(
                 (ui.max_rect().center().x - ui.cursor().left() - toolbar_width / 2.0).max(8.0),
             );
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.repo.is_some() && !self.busy, |ui| {
-                    let undo = ui
-                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo"))
+                    let undo = toolbar_button(ui, "Undo", !self.undo_stack.is_empty())
                         .on_hover_text(format!(
                             "Undo: {}",
                             self.undo_stack.last().map_or("none", UndoAction::label)
@@ -1936,8 +1949,7 @@ impl GitVibe {
                     if undo.clicked() {
                         self.undo_last(false);
                     }
-                    let redo = ui
-                        .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo"))
+                    let redo = toolbar_button(ui, "Redo", !self.redo_stack.is_empty())
                         .on_hover_text(format!(
                             "Redo: {}",
                             self.redo_stack.last().map_or("none", UndoAction::label)
@@ -1948,43 +1960,75 @@ impl GitVibe {
                     if toolbar_action(ui, "Fetch") {
                         self.git(&["fetch", "--all", "--prune"]);
                     }
-                    if toolbar_action(
-                        ui,
-                        if self.pull_mode == PullMode::FetchAll {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        let pull_label = if self.pull_mode == PullMode::FetchAll {
                             "Fetch"
                         } else {
                             "Pull"
-                        },
-                    ) {
-                        self.run_pull_mode();
-                    }
-                    let pull_menu = ui.menu_button("v", |ui| {
-                        ui.label(
-                            RichText::new("Default pull action")
-                                .size(11.0)
-                                .color(muted()),
-                        );
-                        ui.separator();
-                        for mode in [
-                            PullMode::FetchAll,
-                            PullMode::Merge,
-                            PullMode::FastForwardOnly,
-                            PullMode::Rebase,
-                        ] {
-                            if ui
-                                .radio_value(&mut self.pull_mode, mode, mode.label())
-                                .clicked()
-                            {
-                                ui.close();
-                            }
-                        }
-                    });
-                    pull_menu.response.widget_info(|| {
-                        egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button,
+                        };
+                        if toolbar_button_with_corner(
+                            ui,
+                            pull_label,
                             true,
-                            "Choose default pull action",
+                            egui::CornerRadius {
+                                nw: 4,
+                                ne: 0,
+                                sw: 4,
+                                se: 0,
+                            },
                         )
+                        .clicked()
+                        {
+                            self.run_pull_mode();
+                        }
+                        let (pull_menu, _) = egui::containers::menu::MenuButton::from_button(
+                            egui::Button::new(" ")
+                                .min_size(egui::vec2(24.0, 28.0))
+                                .corner_radius(egui::CornerRadius {
+                                    nw: 0,
+                                    ne: 4,
+                                    sw: 0,
+                                    se: 4,
+                                }),
+                        )
+                        .ui(ui, |ui| {
+                            ui.label(
+                                RichText::new("Default pull action")
+                                    .size(11.0)
+                                    .color(muted()),
+                            );
+                            ui.separator();
+                            for mode in [
+                                PullMode::FetchAll,
+                                PullMode::Merge,
+                                PullMode::FastForwardOnly,
+                                PullMode::Rebase,
+                            ] {
+                                if ui
+                                    .radio_value(&mut self.pull_mode, mode, mode.label())
+                                    .clicked()
+                                {
+                                    ui.close();
+                                }
+                            }
+                        });
+                        let c = pull_menu.rect.center();
+                        ui.painter().add(egui::Shape::line(
+                            vec![
+                                egui::pos2(c.x - 3.5, c.y - 1.5),
+                                egui::pos2(c.x, c.y + 2.0),
+                                egui::pos2(c.x + 3.5, c.y - 1.5),
+                            ],
+                            Stroke::new(1.25, text()),
+                        ));
+                        pull_menu.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                true,
+                                "Choose default pull action",
+                            )
+                        });
                     });
                     if toolbar_action(ui, "Push") {
                         self.git(&["push"]);
@@ -5107,6 +5151,20 @@ impl GitVibe {
         });
         ui.add_space(10.0);
         ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(!self.busy, egui::Button::new("Edit this file"))
+                .on_hover_text("Open the working file in its default editor")
+                .clicked()
+            {
+                let result = self
+                    .repo
+                    .as_ref()
+                    .ok_or("No repository selected".to_owned())
+                    .and_then(|repo| external::edit_file(repo, &path));
+                if let Err(error) = result {
+                    self.error = error;
+                }
+            }
             if self.selected_file_staged {
                 if ui
                     .add_enabled(!self.busy, egui::Button::new("Unstage file"))
@@ -7792,7 +7850,7 @@ fn sidebar_branch_row(
     } else if response.hovered() {
         ui.painter().rect_filled(rect, 0.0, panel_alt());
     }
-    let x = rect.left() + 14.0 + depth;
+    let x = rect.left() + if selected { 27.0 } else { 14.0 } + depth;
     ui.painter().line_segment(
         [
             egui::pos2(x, rect.center().y - 4.0),
@@ -7817,7 +7875,9 @@ fn sidebar_branch_row(
         ],
         Stroke::new(1.0, if selected { text() } else { muted() }),
     );
-    let max_chars = ((rect.width() - depth - 32.0) / 6.1).floor().max(5.0) as usize;
+    let max_chars = ((rect.width() - depth - if selected { 45.0 } else { 32.0 }) / 6.1)
+        .floor()
+        .max(5.0) as usize;
     let mut display = label.chars().take(max_chars).collect::<String>();
     if label.chars().count() > max_chars {
         display.truncate(display.len().saturating_sub(3));
@@ -7834,19 +7894,82 @@ fn sidebar_branch_row(
 }
 
 fn toolbar_action(ui: &mut egui::Ui, label: &str) -> bool {
-    let background = ui.painter().add(egui::Shape::Noop);
-    let response = ui.add(
-        egui::Button::new(RichText::new(label).size(11.5).color(text()))
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::NONE),
+    toolbar_button(ui, label, true).clicked()
+}
+
+fn toolbar_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
+    toolbar_button_with_corner(ui, label, enabled, egui::CornerRadius::same(4))
+}
+
+fn toolbar_button_with_corner(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    corners: egui::CornerRadius,
+) -> egui::Response {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(RichText::new(format!("    {label}")).size(11.5))
+            .min_size(egui::vec2(0.0, 28.0))
+            .corner_radius(corners),
     );
-    if response.hovered() {
-        ui.painter().set(
-            background,
-            egui::Shape::rect_filled(response.rect, 3.0, elevated()),
+    let color = if enabled { text() } else { muted() };
+    let c = egui::pos2(response.rect.left() + 12.5, response.rect.center().y);
+    let stroke = Stroke::new(1.4, color);
+    let line = |a: (f32, f32), b: (f32, f32)| {
+        ui.painter().line_segment(
+            [
+                egui::pos2(c.x + a.0, c.y + a.1),
+                egui::pos2(c.x + b.0, c.y + b.1),
+            ],
+            stroke,
         );
+    };
+    match label {
+        "Undo" | "Redo" | "Refresh" => {
+            let flip = if label == "Redo" { -1.0 } else { 1.0 };
+            ui.painter().circle_stroke(c, 4.3, stroke);
+            line((-5.6 * flip, -3.7), (-1.6 * flip, -3.7));
+            line((-5.6 * flip, -3.7), (-5.6 * flip, 0.3));
+        }
+        "Fetch" | "Pull" | "Push" => {
+            let up = label == "Push";
+            let sign = if up { -1.0 } else { 1.0 };
+            line((0.0, -4.8 * sign), (0.0, 3.0 * sign));
+            line((-3.0, 0.0 * sign), (0.0, 3.0 * sign));
+            line((3.0, 0.0 * sign), (0.0, 3.0 * sign));
+            line((-4.8, 5.0 * sign), (4.8, 5.0 * sign));
+        }
+        "Branch" => {
+            line((-3.0, -4.0), (-3.0, 4.0));
+            line((-3.0, 1.0), (3.0, 1.0));
+            for point in [(-3.0, -4.0), (-3.0, 4.0), (3.0, 1.0)] {
+                ui.painter()
+                    .circle_filled(egui::pos2(c.x + point.0, c.y + point.1), 1.7, color);
+            }
+        }
+        "Stash" => {
+            line((-5.0, 1.0), (-5.0, 5.0));
+            line((-5.0, 5.0), (5.0, 5.0));
+            line((5.0, 5.0), (5.0, 1.0));
+            line((0.0, -5.0), (0.0, 1.0));
+            line((-2.6, -1.5), (0.0, 1.0));
+            line((2.6, -1.5), (0.0, 1.0));
+        }
+        "Terminal" => {
+            line((-4.5, -3.0), (-0.5, 0.0));
+            line((-0.5, 0.0), (-4.5, 3.0));
+            line((1.0, 3.5), (5.0, 3.5));
+        }
+        "Commands" => {
+            for (x, y) in [(-3.0, -3.0), (3.0, -3.0), (-3.0, 3.0), (3.0, 3.0)] {
+                ui.painter()
+                    .circle_filled(egui::pos2(c.x + x, c.y + y), 1.3, color);
+            }
+        }
+        _ => {}
     }
-    response.clicked()
+    response
 }
 
 fn action(ui: &mut egui::Ui, label: &str, prominent: bool) -> bool {

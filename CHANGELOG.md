@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-30
+
+### Added
+
+- Open a selected working-tree file in its default external editor from the diff view, with repository-bound path checks.
+
+### Improved
+
+- Give the main Git toolbar consistent bordered buttons and drawn icons, with Pull and its options arrow joined into one control.
+- Separate the current-branch checkmark from the branch icon and draw the merge-target indicator without relying on a missing font glyph.
+
 ## [0.17.0] - 2026-09-30
 
 ### Added
@@ -193,7 +204,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/boubou666/GitVibe/compare/v0.17.0...v0.18.0
+[0.17.0]: https://github.com/boubou666/GitVibe/compare/v0.16.0...v0.17.0
+[0.16.0]: https://github.com/boubou666/GitVibe/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/boubou666/GitVibe/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/boubou666/GitVibe/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/boubou666/GitVibe/compare/v0.12.0...v0.13.0
