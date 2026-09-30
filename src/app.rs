@@ -3774,7 +3774,8 @@ impl GitVibe {
             ui.colored_label(red(), &self.lfs_error);
         }
         let Some(status) = self.lfs_status.clone() else {
-            if self.lfs_loaded_for.is_some() && !self.busy && self.lfs_error.is_empty() {
+            let loading = self.busy || matches!(self.pending, Some(Job::LoadLfs));
+            if self.lfs_loaded_for.is_some() && !loading && self.lfs_error.is_empty() {
                 ui.label("Git LFS is not installed. Install Git LFS and refresh this page.");
             } else if self.lfs_error.is_empty() {
                 ui.label("Loading Git LFS status…");
