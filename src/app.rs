@@ -1935,29 +1935,32 @@ impl GitVibe {
                     .color(if count == 0 { accent() } else { orange() }),
                 );
             }
-            let toolbar_width = 820.0;
+            let compact_toolbar = ui.available_width() < 820.0;
+            let toolbar_width = if compact_toolbar { 380.0 } else { 820.0 };
             ui.add_space(
                 (ui.max_rect().center().x - ui.cursor().left() - toolbar_width / 2.0).max(8.0),
             );
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.repo.is_some() && !self.busy, |ui| {
-                    let undo = toolbar_button(ui, "Undo", !self.undo_stack.is_empty())
-                        .on_hover_text(format!(
-                            "Undo: {}",
-                            self.undo_stack.last().map_or("none", UndoAction::label)
-                        ));
+                    let undo =
+                        toolbar_button(ui, "Undo", !self.undo_stack.is_empty(), compact_toolbar)
+                            .on_hover_text(format!(
+                                "Undo: {}",
+                                self.undo_stack.last().map_or("none", UndoAction::label)
+                            ));
                     if undo.clicked() {
                         self.undo_last(false);
                     }
-                    let redo = toolbar_button(ui, "Redo", !self.redo_stack.is_empty())
-                        .on_hover_text(format!(
-                            "Redo: {}",
-                            self.redo_stack.last().map_or("none", UndoAction::label)
-                        ));
+                    let redo =
+                        toolbar_button(ui, "Redo", !self.redo_stack.is_empty(), compact_toolbar)
+                            .on_hover_text(format!(
+                                "Redo: {}",
+                                self.redo_stack.last().map_or("none", UndoAction::label)
+                            ));
                     if redo.clicked() {
                         self.undo_last(true);
                     }
-                    if toolbar_action(ui, "Fetch") {
+                    if toolbar_action(ui, "Fetch", compact_toolbar) {
                         self.git(&["fetch", "--all", "--prune"]);
                     }
                     ui.horizontal(|ui| {
@@ -1971,6 +1974,7 @@ impl GitVibe {
                             ui,
                             pull_label,
                             true,
+                            compact_toolbar,
                             egui::CornerRadius {
                                 nw: 4,
                                 ne: 0,
@@ -1978,6 +1982,7 @@ impl GitVibe {
                                 se: 0,
                             },
                         )
+                        .on_hover_text(format!("{} ({})", pull_label, self.pull_mode.label()))
                         .clicked()
                         {
                             self.run_pull_mode();
@@ -2030,23 +2035,23 @@ impl GitVibe {
                             )
                         });
                     });
-                    if toolbar_action(ui, "Push") {
+                    if toolbar_action(ui, "Push", compact_toolbar) {
                         self.git(&["push"]);
                     }
-                    if toolbar_action(ui, "Branch") {
+                    if toolbar_action(ui, "Branch", compact_toolbar) {
                         self.page = Page::Branches;
                     }
-                    if toolbar_action(ui, "Stash") {
+                    if toolbar_action(ui, "Stash", compact_toolbar) {
                         self.page = Page::Stashes;
                     }
-                    if toolbar_action(ui, "Terminal") {
+                    if toolbar_action(ui, "Terminal", compact_toolbar) {
                         self.terminal_open = !self.terminal_open;
                     }
-                    if toolbar_action(ui, "Refresh") {
+                    if toolbar_action(ui, "Refresh", compact_toolbar) {
                         self.queue(Job::Refresh);
                     }
                 });
-                if toolbar_action(ui, "Commands") {
+                if toolbar_action(ui, "Commands", compact_toolbar) {
                     self.open_palette();
                 }
                 if self.busy {
@@ -7893,28 +7898,44 @@ fn sidebar_branch_row(
     response
 }
 
-fn toolbar_action(ui: &mut egui::Ui, label: &str) -> bool {
-    toolbar_button(ui, label, true).clicked()
+fn toolbar_action(ui: &mut egui::Ui, label: &str, compact: bool) -> bool {
+    toolbar_button(ui, label, true, compact)
+        .on_hover_text(label)
+        .clicked()
 }
 
-fn toolbar_button(ui: &mut egui::Ui, label: &str, enabled: bool) -> egui::Response {
-    toolbar_button_with_corner(ui, label, enabled, egui::CornerRadius::same(4))
+fn toolbar_button(ui: &mut egui::Ui, label: &str, enabled: bool, compact: bool) -> egui::Response {
+    toolbar_button_with_corner(ui, label, enabled, compact, egui::CornerRadius::same(4))
 }
 
 fn toolbar_button_with_corner(
     ui: &mut egui::Ui,
     label: &str,
     enabled: bool,
+    compact: bool,
     corners: egui::CornerRadius,
 ) -> egui::Response {
+    let button_text = if compact {
+        String::new()
+    } else {
+        format!("    {label}")
+    };
     let response = ui.add_enabled(
         enabled,
-        egui::Button::new(RichText::new(format!("    {label}")).size(11.5))
-            .min_size(egui::vec2(0.0, 28.0))
+        egui::Button::new(RichText::new(button_text).size(11.5))
+            .min_size(egui::vec2(if compact { 30.0 } else { 0.0 }, 28.0))
             .corner_radius(corners),
     );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     let color = if enabled { text() } else { muted() };
-    let c = egui::pos2(response.rect.left() + 12.5, response.rect.center().y);
+    let c = egui::pos2(
+        if compact {
+            response.rect.center().x
+        } else {
+            response.rect.left() + 12.5
+        },
+        response.rect.center().y,
+    );
     let stroke = Stroke::new(1.4, color);
     let line = |a: (f32, f32), b: (f32, f32)| {
         ui.painter().line_segment(
