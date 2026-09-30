@@ -352,6 +352,8 @@ enum Job {
     Refresh,
 }
 
+type DiffColors = HashMap<(String, String), syntax::HunkColors>;
+
 enum Done {
     Loaded(Result<Snapshot, String>),
     Ran(Result<(String, Snapshot), String>),
@@ -365,7 +367,7 @@ enum Done {
     PullRequests(Result<Vec<github::PullRequest>, String>),
     PullRequestCreated(Result<String, String>),
     Exported(Result<String, String>),
-    Inspected(Result<String, String>),
+    Inspected(Result<(String, DiffColors), String>),
     CommitInspected(String, Result<(String, Vec<git::CommitFile>), String>),
     Searched(Result<(Vec<git::Commit>, bool), String>),
     FileHistory(String, Result<Vec<git::Commit>, String>),
@@ -976,8 +978,11 @@ impl GitVibe {
                 ),
                 Job::Shell(command, cwd) => Done::Shell(run_shell_command(&cwd, &command)),
                 Job::Inspect(args) => Done::Inspected(
-                    repo.ok_or("No repository selected".to_owned())
-                        .and_then(|p| git::run_owned(&p, &args)),
+                    repo.ok_or("No repository selected".to_owned()).and_then(|p| {
+                        let detail = git::run_owned(&p, &args)?;
+                        let colors = syntax::highlight_diff(&p, &args, &detail);
+                        Ok((detail, colors))
+                    }),
                 ),
                 Job::InspectCommit(id) => Done::CommitInspected(id.clone(),
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
@@ -992,7 +997,7 @@ impl GitVibe {
                             let bytes = std::fs::read(p.join(&path)).map_err(|e| e.to_string())?;
                             let preview =
                                 String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)]);
-                            Ok(format!("Untracked file: {path}\n\n{preview}"))
+                            Ok((format!("Untracked file: {path}\n\n{preview}"), HashMap::new()))
                         }),
                 ),
                 Job::InspectConflict(path) => Done::Inspected(
@@ -1000,14 +1005,14 @@ impl GitVibe {
                         .and_then(|p| {
                             let file = p.join(&path);
                             if !file.exists() {
-                                return Ok(format!(
+                                return Ok((format!(
                                     "Conflict in {path}\n\nThe file is absent in the working tree. Choose a side or mark its deletion resolved."
-                                ));
+                                ), HashMap::new()));
                             }
                             let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
                             let preview =
                                 String::from_utf8_lossy(&bytes[..bytes.len().min(64 * 1024)]);
-                            Ok(format!("Conflict in {path}\n\n{preview}"))
+                            Ok((format!("Conflict in {path}\n\n{preview}"), HashMap::new()))
                         }),
                 ),
                 Job::ApplyHunk(patch, reverse) => {
@@ -1278,8 +1283,12 @@ impl GitVibe {
                 self.conflict_action = false;
             }
             Done::Inspected(result) => match result {
-                Ok(text) => {
+                Ok((text, colors)) => {
                     self.detail = text;
+                    self.syntax_cache = colors
+                        .into_iter()
+                        .map(|(key, colors)| (key, Arc::new(colors)))
+                        .collect();
                     self.error.clear();
                 }
                 Err(error) => self.error = error,
