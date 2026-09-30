@@ -107,9 +107,14 @@ pub fn restore_file_from_commit(repo: &Path, commit: &str, path: &str) -> Result
     }
     if path.is_empty()
         || Path::new(path).is_absolute()
-        || Path::new(path)
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
+        || Path::new(path).components().any(|part| {
+            matches!(
+                part,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
     {
         return Err("Choose a repository file to restore".into());
     }
@@ -126,7 +131,9 @@ pub fn restore_file_from_commit(repo: &Path, commit: &str, path: &str) -> Result
             "{path} has uncommitted changes. Save, commit, or stash them before restoring this version."
         ));
     }
-    run(repo, &["cat-file", "-e", &format!("{commit}:{path}")])?;
+    if run(repo, &["cat-file", "-t", &format!("{commit}:{path}")])? != "blob" {
+        return Err("Only regular files and symlinks can be restored here".into());
+    }
     run(
         repo,
         &[
@@ -1808,6 +1815,7 @@ mod tests {
         );
         std::fs::write(&file, "local edit\n").unwrap();
         assert!(restore_file_from_commit(&root, &old, "note.txt").is_err());
+        assert!(restore_file_from_commit(&root, &old, "../note.txt").is_err());
         assert_eq!(
             std::fs::read_to_string(&file)
                 .unwrap()
