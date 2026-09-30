@@ -1017,6 +1017,37 @@ pub fn run_owned(repo: &Path, args: &[String]) -> Result<String, String> {
     run(repo, &refs)
 }
 
+/// Read a text version of a file without loading arbitrarily large blobs for diff coloring.
+/// `revision` is a Git tree-ish, `:` for the index, or `None` for the worktree.
+pub fn diff_source_text(repo: &Path, revision: Option<&str>, path: &str) -> Option<String> {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    if let Some(revision) = revision {
+        let spec = if revision == ":" {
+            format!(":{path}")
+        } else {
+            format!("{revision}:{path}")
+        };
+        let size = run(repo, &["cat-file", "-s", &spec])
+            .ok()?
+            .parse::<u64>()
+            .ok()?;
+        if size > MAX_BYTES {
+            return None;
+        }
+        let output = git_output(Some(repo), &["show", &spec]).ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8(output.stdout).ok())
+            .flatten()
+    } else {
+        let file = repo.join(path);
+        (std::fs::metadata(&file).ok()?.len() <= MAX_BYTES)
+            .then(|| std::fs::read_to_string(file).ok())
+            .flatten()
+    }
+}
+
 pub fn export_patch(repo: &Path, args: &[String], destination: &Path) -> Result<String, String> {
     let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
     let output = git_output(Some(repo), &refs)?;

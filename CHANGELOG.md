@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-30
+
+### Improved
+
+- Recover syntax highlighting state across distant diff hunks by reading the old and new text versions of each file. This applies to working-tree, staged, commit, and comparison diffs.
+- Parse and color file versions on the inspection worker. Large, unavailable, or non-UTF-8 files keep the existing hunk-based fallback.
+
 ## [0.15.0] - 2026-09-30
 
 ### Added

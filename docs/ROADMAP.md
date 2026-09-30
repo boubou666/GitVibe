@@ -60,14 +60,17 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 1. Restore a file from a selected commit into the working tree and index, with a guard against overwriting local changes.
 2. Load a configured Git commit template into the commit editor and add validated co-author trailers.
 
+## Completed in 0.16.0
+
+1. Recover syntax parser state across omitted lines between diff hunks for working-tree, staged, commit, and comparison diffs. Cap text reads at 1 MB per side and retain hunk coloring when a version is unavailable.
+
 ## Next: GitKraken workflow parity
 
-1. **Diff review.** Add better syntax parser state recovery across distant hunks. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
-2. **Broader undo and redo.** Extend explicit recovery data beyond staging to safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
-3. **Accessibility.** Continue reviewing focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
-4. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
-5. **More GitKraken workflows.** Add external file editing, amend controls, and direct commit context actions for rewording and dropping commits. Add a clear push-after-commit option. GitKraken describes these in its [file editing](https://help.gitkraken.com/gitkraken-desktop/editing-files/) and [commit](https://help.gitkraken.com/gitkraken-desktop/commits/) guides.
-6. **Git LFS follow-up.** Add locked-file workflows and safe local-object pruning. Define how GitVibe should present LFS migration, which can rewrite existing history, before offering it in the UI. See GitKraken's [LFS guide](https://help.gitkraken.com/gitkraken-desktop/git-lfs/).
+1. **Broader undo and redo.** Extend explicit recovery data beyond staging to safe, reversible local Git actions. History rewriting and working-tree discards need separate safeguards. See GitKraken's [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
+2. **Accessibility.** Continue reviewing focus order, labels, contrast, and screen-reader semantics across all pages. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison for further keyboard coverage.
+3. **Repository operations.** Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
+4. **More GitKraken workflows.** Add external file editing, amend controls, and direct commit context actions for rewording and dropping commits. Add a clear push-after-commit option. GitKraken describes these in its [file editing](https://help.gitkraken.com/gitkraken-desktop/editing-files/) and [commit](https://help.gitkraken.com/gitkraken-desktop/commits/) guides.
+5. **Git LFS follow-up.** Add locked-file workflows and safe local-object pruning. Define how GitVibe should present LFS migration, which can rewrite existing history, before offering it in the UI. See GitKraken's [LFS guide](https://help.gitkraken.com/gitkraken-desktop/git-lfs/).
 
 ## Needs account or distribution decisions
 
