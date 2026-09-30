@@ -25,13 +25,18 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 1. Interactive rebase editor for reorder, pick, squash, reword, and drop on linear commit ranges. A confirmation step and reflog recovery path accompany history rewriting.
 2. Diff line wrapping, previous and next change navigation, and confirmed hunk discard. Full-file view and word-level highlights were already available.
 
+## Completed in 0.9.0
+
+1. Side by side diff mode for working-tree and commit changes.
+2. Worktrees in the branch rail, with change counts and their own WIP rows. Branch context menus can start a worktree.
+3. Edit remote URLs in the Branches & tags view.
+
 ## Next: GitKraken workflow parity
 
-1. **Diff review.** Add split view and language-aware syntax coloring. GitKraken documents these modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
+1. **Diff review.** Improve syntax coloring with language-aware parsing. GitKraken documents its diff modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
 2. **Undo and redo.** Track reversible local Git actions with explicit recovery data. GitKraken limits undo to supported recent actions; GitVibe should make the same scope visible before offering a button. See its [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
 3. **Keyboard workflow.** Add a command palette, tab switching, graph navigation, stage/unstage shortcuts, and an accessibility pass for focus order, labels, contrast, and screen-reader semantics. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison.
-4. **Worktree context.** Show worktrees in the branch rail and their separate WIP state in the graph, and offer worktree creation from branch context menus. GitKraken's [worktree guide](https://help.gitkraken.com/gitkraken-desktop/worktrees/) describes those interactions.
-5. **Repository operations.** Add remote URL editing and a searchable repository command menu. Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
+4. **Repository operations.** Add a searchable repository command menu. Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
 
 ## Needs account or distribution decisions
 

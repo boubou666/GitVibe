@@ -15,6 +15,7 @@ pub struct Snapshot {
     pub remote_branches: Vec<Ref>,
     pub tags: Vec<Ref>,
     pub remotes: Vec<String>,
+    pub remote_urls: std::collections::BTreeMap<String, String>,
     pub stashes: Vec<String>,
     pub worktrees: Vec<Worktree>,
     pub submodules: Vec<Submodule>,
@@ -30,6 +31,7 @@ pub struct Worktree {
     pub current: bool,
     pub locked: bool,
     pub prunable: bool,
+    pub dirty_count: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -170,6 +172,18 @@ pub struct DiffHunk {
     pub lines: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffSide {
+    pub number: usize,
+    pub line: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SplitDiffRow {
+    pub old: Option<DiffSide>,
+    pub new: Option<DiffSide>,
+}
+
 #[derive(Clone)]
 pub struct CommitFile {
     pub status: String,
@@ -210,6 +224,59 @@ pub fn commit_files(repo: &Path, id: &str) -> Result<Vec<CommitFile>, String> {
 }
 
 impl DiffHunk {
+    pub fn split_rows(&self) -> Vec<SplitDiffRow> {
+        let numbers = self.line_numbers();
+        let mut rows = Vec::new();
+        let mut index = 0;
+        while index < self.lines.len() {
+            let line = &self.lines[index];
+            if line.starts_with(' ') {
+                let (old, new) = numbers[index];
+                rows.push(SplitDiffRow {
+                    old: old.map(|number| DiffSide {
+                        number,
+                        line: line.clone(),
+                    }),
+                    new: new.map(|number| DiffSide {
+                        number,
+                        line: line.clone(),
+                    }),
+                });
+                index += 1;
+            } else if line.starts_with('+') || line.starts_with('-') {
+                let mut old = Vec::new();
+                let mut new = Vec::new();
+                while index < self.lines.len()
+                    && (self.lines[index].starts_with('+') || self.lines[index].starts_with('-'))
+                {
+                    let line = &self.lines[index];
+                    if let Some(number) = numbers[index].0 {
+                        old.push(DiffSide {
+                            number,
+                            line: line.clone(),
+                        });
+                    } else if let Some(number) = numbers[index].1 {
+                        new.push(DiffSide {
+                            number,
+                            line: line.clone(),
+                        });
+                    }
+                    index += 1;
+                }
+                let count = old.len().max(new.len());
+                for row in 0..count {
+                    rows.push(SplitDiffRow {
+                        old: old.get(row).cloned(),
+                        new: new.get(row).cloned(),
+                    });
+                }
+            } else {
+                index += 1;
+            }
+        }
+        rows
+    }
+
     pub fn line_numbers(&self) -> Vec<(Option<usize>, Option<usize>)> {
         let heading = self.heading.split("@@").nth(1).unwrap_or("").trim();
         let mut fields = heading.split_whitespace();
@@ -665,6 +732,15 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
     let remotes = run(&root, &["remote"])?
         .lines()
         .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let remote_urls = remotes
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                run(&root, &["remote", "get-url", name]).unwrap_or_default(),
+            )
+        })
         .collect();
     let stashes = run(&root, &["stash", "list", "--format=%gd  %s"])?
         .lines()
@@ -684,6 +760,7 @@ pub fn snapshot_with_limit(repo: &Path, limit: usize) -> Result<Snapshot, String
         remote_branches,
         tags,
         remotes,
+        remote_urls,
         stashes,
         worktrees,
         submodules,
@@ -716,6 +793,7 @@ pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
                 current: false,
                 locked: false,
                 prunable: false,
+                dirty_count: None,
             });
         } else if let Some(worktree) = current.as_mut() {
             if let Some(head) = field.strip_prefix("HEAD ") {
@@ -739,6 +817,9 @@ pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
             .canonicalize()
             .unwrap_or_else(|_| worktree.path.clone())
             == canonical_repo;
+        if !worktree.prunable && worktree.path.is_dir() {
+            worktree.dirty_count = status(&worktree.path).ok().map(|changes| changes.len());
+        }
     }
     Ok(result)
 }
@@ -1533,6 +1614,23 @@ mod tests {
             && tree.branch.as_deref() == Some("linked-test")));
         assert_eq!(listed.iter().filter(|tree| tree.current).count(), 1);
         assert!(linked.join(".git").is_file());
+        assert_eq!(
+            listed
+                .iter()
+                .find(|tree| tree.path == linked)
+                .and_then(|tree| tree.dirty_count),
+            Some(0)
+        );
+        std::fs::write(linked.join("scratch.txt"), "uncommitted\n").unwrap();
+        assert_eq!(
+            worktrees(&root)
+                .unwrap()
+                .iter()
+                .find(|tree| tree.path == linked)
+                .and_then(|tree| tree.dirty_count),
+            Some(1)
+        );
+        std::fs::remove_file(linked.join("scratch.txt")).unwrap();
 
         let child = init(&base.join("child source")).unwrap();
         std::fs::write(root.join(".gitmodules"), "").unwrap();
@@ -1711,6 +1809,24 @@ mod tests {
                 .remotes
                 .iter()
                 .any(|name| name == "sample")
+        );
+        run(
+            &root,
+            &[
+                "remote",
+                "set-url",
+                "sample",
+                "https://example.invalid/new.git",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot(&root)
+                .unwrap()
+                .remote_urls
+                .get("sample")
+                .map(String::as_str),
+            Some("https://example.invalid/new.git")
         );
         run(
             &root,
@@ -2126,5 +2242,42 @@ mod tests {
             1
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn split_diff_aligns_replacements_and_context() {
+        let hunk = DiffHunk {
+            heading: "@@ -10,4 +10,5 @@".into(),
+            patch: String::new(),
+            lines: vec![
+                " common".into(),
+                "-old one".into(),
+                "-old two".into(),
+                "+new one".into(),
+                "+new two".into(),
+                "+new three".into(),
+                " tail".into(),
+                "\\ No newline at end of file".into(),
+            ],
+        };
+        let rows = hunk.split_rows();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].old.as_ref().map(|side| side.number), Some(10));
+        assert_eq!(rows[0].new.as_ref().map(|side| side.number), Some(10));
+        assert_eq!(
+            rows[1].old.as_ref().map(|side| side.line.as_str()),
+            Some("-old one")
+        );
+        assert_eq!(
+            rows[1].new.as_ref().map(|side| side.line.as_str()),
+            Some("+new one")
+        );
+        assert!(rows[3].old.is_none());
+        assert_eq!(
+            rows[3].new.as_ref().map(|side| side.line.as_str()),
+            Some("+new three")
+        );
+        assert_eq!(rows[4].old.as_ref().map(|side| side.number), Some(13));
+        assert_eq!(rows[4].new.as_ref().map(|side| side.number), Some(14));
     }
 }
