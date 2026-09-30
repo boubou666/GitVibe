@@ -27,7 +27,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Run PowerShell commands on Windows or shell commands on Linux and macOS from a docked terminal with command history and working directory navigation.
 - Drag a repository folder onto the window to open it.
 
-The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The Rebase page does not yet offer interactive commit reorder, squash, reword, or drop. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts. Press Ctrl/Cmd+F to search commits and F5 to refresh the repository.
+The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The Rebase page can edit a linear sequence of up to 40 commits. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts. Press Ctrl/Cmd+F to search commits and F5 to refresh the repository.
 
 ## Download and run
 
@@ -70,7 +70,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes an interactive rebase editor, fuller diff modes, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes split diffs, undo and redo, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

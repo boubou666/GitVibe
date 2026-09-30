@@ -4,6 +4,9 @@ mod github;
 mod updates;
 
 fn main() -> eframe::Result {
+    if let Some(code) = git::run_helper_command() {
+        std::process::exit(code);
+    }
     #[cfg(target_os = "windows")]
     dark_titlebar::enable();
     let options = eframe::NativeOptions {

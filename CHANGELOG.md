@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-30
+
+### Added
+
+- Interactive rebase editor to reorder, pick, squash, reword, or drop up to 40 linear commits, with a confirmation step and conflict continuation controls.
+- Diff line wrapping and previous/next hunk navigation in the working-tree view.
+- Confirmed hunk discard for unstaged changes, leaving other hunks in the same file intact.
+
+### Changed
+
+- Clear a previous file's diff immediately when selecting a new changed file.
+
 ## [0.7.0] - 2026-09-30
 
 ### Added

@@ -20,14 +20,18 @@ GitVibe aims to cover daily Git work in a visual Rust desktop client. Its termin
 6. Export commit and file patches, and apply a patch from disk.
 7. Add and remove remotes, and create annotated tags.
 
+## Completed in 0.8.0
+
+1. Interactive rebase editor for reorder, pick, squash, reword, and drop on linear commit ranges. A confirmation step and reflog recovery path accompany history rewriting.
+2. Diff line wrapping, previous and next change navigation, and confirmed hunk discard. Full-file view and word-level highlights were already available.
+
 ## Next: GitKraken workflow parity
 
-1. **Interactive rebase editor.** Add a commit todo screen for reorder, pick, squash, reword, and drop, with safe recovery of the previous branch tip. The current Rebase page handles the rebase operation and conflicts but cannot edit the commit sequence.
-2. **Diff review.** Add split and full-file modes, word-level highlights, wrap toggle, change navigation, and hunk discard. Improve syntax coloring with language-aware parsing. GitKraken documents these modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
-3. **Undo and redo.** Track reversible local Git actions with explicit recovery data. GitKraken limits undo to supported recent actions; GitVibe should make the same scope visible before offering a button. See its [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
-4. **Keyboard workflow.** Add a command palette, tab switching, graph navigation, stage/unstage shortcuts, and an accessibility pass for focus order, labels, contrast, and screen-reader semantics. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison.
-5. **Worktree context.** Show worktrees in the branch rail and their separate WIP state in the graph, and offer worktree creation from branch context menus. GitKraken's [worktree guide](https://help.gitkraken.com/gitkraken-desktop/worktrees/) describes those interactions.
-6. **Repository operations.** Add remote URL editing and a searchable repository command menu. Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
+1. **Diff review.** Add split view and language-aware syntax coloring. GitKraken documents these modes and actions in its [diff guide](https://help.gitkraken.com/gitkraken-desktop/diff/).
+2. **Undo and redo.** Track reversible local Git actions with explicit recovery data. GitKraken limits undo to supported recent actions; GitVibe should make the same scope visible before offering a button. See its [undo guide](https://help.gitkraken.com/gitkraken-desktop/undo-and-redo/).
+3. **Keyboard workflow.** Add a command palette, tab switching, graph navigation, stage/unstage shortcuts, and an accessibility pass for focus order, labels, contrast, and screen-reader semantics. Use the [GitKraken shortcut reference](https://help.gitkraken.com/gitkraken-desktop/keyboard-shortcuts/) as a comparison.
+4. **Worktree context.** Show worktrees in the branch rail and their separate WIP state in the graph, and offer worktree creation from branch context menus. GitKraken's [worktree guide](https://help.gitkraken.com/gitkraken-desktop/worktrees/) describes those interactions.
+5. **Repository operations.** Add remote URL editing and a searchable repository command menu. Clone provider tabs currently guide URL entry; account-backed repository browsing remains to be designed.
 
 ## Needs account or distribution decisions
 

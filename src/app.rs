@@ -247,11 +247,14 @@ enum Job {
     InspectFile(String),
     InspectConflict(String),
     ApplyHunk(String, bool),
+    DiscardHunk(String),
     ApplyLine(String, bool),
     SearchHistory(String),
     FileHistory(String),
     LoadConflict(String),
     SaveConflict(git::ConflictDocument),
+    LoadInteractiveRebase(String),
+    StartInteractiveRebase(git::RebasePlan),
     ResolveConflict(String, git::ConflictSide),
     MarkResolved(String),
     Refresh,
@@ -270,6 +273,7 @@ enum Done {
     Searched(Result<(Vec<git::Commit>, bool), String>),
     FileHistory(String, Result<Vec<git::Commit>, String>),
     ConflictLoaded(Result<git::ConflictDocument, String>),
+    InteractiveRebaseLoaded(Result<git::RebasePlan, String>),
 }
 
 pub struct GitVibe {
@@ -299,6 +303,11 @@ pub struct GitVibe {
     submodule_path: String,
     rebase_onto: String,
     rebase_autostash: bool,
+    interactive_plan: Option<git::RebasePlan>,
+    confirm_interactive_rebase: bool,
+    diff_wrap: bool,
+    diff_hunk_focus: usize,
+    diff_scroll_pending: bool,
     pr_base: String,
     pr_title: String,
     pr_body: String,
@@ -343,6 +352,7 @@ pub struct GitVibe {
     busy: bool,
     show_clone: bool,
     confirm_discard: Option<String>,
+    confirm_discard_hunk: Option<String>,
     confirm_commit_action: Option<(CommitAction, String)>,
     confirm_checkout_commit: Option<String>,
     create_ref_at: Option<(RefAtKind, String)>,
@@ -505,6 +515,11 @@ impl GitVibe {
             submodule_path: String::new(),
             rebase_onto: String::new(),
             rebase_autostash: false,
+            interactive_plan: None,
+            confirm_interactive_rebase: false,
+            diff_wrap: false,
+            diff_hunk_focus: 0,
+            diff_scroll_pending: false,
             pr_base: "main".to_owned(),
             pr_title: String::new(),
             pr_body: String::new(),
@@ -549,6 +564,7 @@ impl GitVibe {
             busy: false,
             show_clone: false,
             confirm_discard: None,
+            confirm_discard_hunk: None,
             confirm_commit_action: None,
             confirm_checkout_commit: None,
             create_ref_at: None,
@@ -669,6 +685,23 @@ impl GitVibe {
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|repo| git::export_patch(&repo, &args, &path)),
                 ),
+                Job::LoadInteractiveRebase(target) => Done::InteractiveRebaseLoaded(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|path| git::load_rebase_plan(&path, &target)),
+                ),
+                Job::StartInteractiveRebase(plan) => match repo {
+                    Some(path) => {
+                        let operation = git::start_interactive_rebase(&path, &plan);
+                        match git::snapshot_with_limit(&path, history_limit) {
+                            Ok(snapshot) => match operation {
+                                Ok(output) => Done::Ran(Ok((output, snapshot))),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
                 Job::Refresh => Done::Loaded(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
@@ -677,10 +710,15 @@ impl GitVibe {
                     Some(p) => {
                         let operation = git::run_owned(&p, &args);
                         match git::snapshot_with_limit(&p, history_limit) {
-                            Ok(snapshot) => match operation {
-                                Ok(output) => Done::Ran(Ok((output, snapshot))),
-                                Err(error) => Done::RanFailed(error, snapshot),
-                            },
+                            Ok(snapshot) => {
+                                if !snapshot.rebase_in_progress {
+                                    let _ = git::cleanup_interactive_rebase(&p);
+                                }
+                                match operation {
+                                    Ok(output) => Done::Ran(Ok((output, snapshot))),
+                                    Err(error) => Done::RanFailed(error, snapshot),
+                                }
+                            }
                             Err(error) => Done::Ran(Err(error)),
                         }
                     }
@@ -765,6 +803,13 @@ impl GitVibe {
                             ))
                         }),
                 ),
+                Job::DiscardHunk(patch) => Done::Ran(
+                    repo.ok_or("No repository selected".to_owned()).and_then(|path| {
+                        git::discard_hunk(&path, &patch)?;
+                        let snapshot = git::snapshot_with_limit(&path, history_limit)?;
+                        Ok(("Hunk discarded".to_owned(), snapshot))
+                    }),
+                ),
                 Job::ApplyLine(patch, reverse) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
                         git::apply_line(&p, &patch, reverse)?;
@@ -841,6 +886,7 @@ impl GitVibe {
                         self.commit_files_id = None;
                         self.pr_loaded_for = None;
                         self.pull_requests.clear();
+                        self.interactive_plan = None;
                     }
                     self.repo = Some(snapshot.root.clone());
                     if self.terminal_cwd.is_none() {
@@ -856,6 +902,7 @@ impl GitVibe {
                     }
                     let first_commit = snapshot.commits.first().map(|commit| commit.id.clone());
                     self.snapshot = Some(snapshot);
+                    self.interactive_plan = None;
                     self.error.clear();
                     if self.selected_commit.is_none()
                         && self.selected_file.is_none()
@@ -893,6 +940,7 @@ impl GitVibe {
                     }
                     self.repo = Some(snapshot.root.clone());
                     self.snapshot = Some(snapshot);
+                    self.interactive_plan = None;
                     if let Some(id) = new_head {
                         self.select_commit(&id);
                     }
@@ -949,6 +997,7 @@ impl GitVibe {
             Done::RanFailed(error, snapshot) => {
                 self.repo = Some(snapshot.root.clone());
                 self.snapshot = Some(snapshot);
+                self.interactive_plan = None;
                 self.error = error;
                 self.committing = false;
                 self.hunk_action = false;
@@ -980,6 +1029,16 @@ impl GitVibe {
                     self.error.clear();
                 }
                 Err(error) => self.error = error,
+            },
+            Done::InteractiveRebaseLoaded(result) => match result {
+                Ok(plan) => {
+                    self.interactive_plan = Some(plan);
+                    self.error.clear();
+                }
+                Err(error) => {
+                    self.interactive_plan = None;
+                    self.error = error;
+                }
             },
             Done::PullRequestCreated(result) => match result {
                 Ok(url) => {
@@ -2124,7 +2183,7 @@ impl GitVibe {
                                 let numbers = hunk.line_numbers();
                                 for (i, line) in hunk.lines.iter().enumerate() {
                                     let (old, new) = numbers[i];
-                                    diff_line_numbered(ui, line, old, new, None);
+                                    diff_line_numbered(ui, line, old, new, None, false);
                                 }
                             }
                         });
@@ -2382,7 +2441,10 @@ impl GitVibe {
                     {
                         self.selected_file = Some(file.path.clone());
                         self.selected_file_staged = staged;
+                        self.diff_hunk_focus = 0;
+                        self.diff_scroll_pending = true;
                         self.selected_commit = None;
+                        self.detail.clear();
                         if file.index == '?' {
                             self.queue(Job::InspectFile(file.path.clone()));
                         } else {
@@ -3192,17 +3254,23 @@ impl GitVibe {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label("Rebase onto");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.rebase_onto)
-                            .hint_text("Branch, tag, or commit SHA")
-                            .desired_width(330.0),
-                    );
+                    if ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.rebase_onto)
+                                .hint_text("Branch, tag, or commit SHA")
+                                .desired_width(330.0),
+                        )
+                        .changed()
+                    {
+                        self.interactive_plan = None;
+                    }
                     egui::ComboBox::from_id_salt("rebase_target_picker")
                         .selected_text("Choose branch")
                         .show_ui(ui, |ui| {
                             for target in targets {
                                 if ui.selectable_label(false, &target).clicked() {
                                     self.rebase_onto = target;
+                                    self.interactive_plan = None;
                                 }
                             }
                         });
@@ -3236,6 +3304,114 @@ impl GitVibe {
                     self.confirm_rebase = Some(args);
                 }
             });
+        ui.add_space(14.0);
+        ui.separator();
+        ui.heading("Interactive rebase");
+        ui.label(
+            "Review each commit before replaying it. Reorder, squash, reword, or drop commits.",
+        );
+        ui.add_space(6.0);
+        if ui
+            .add_enabled(
+                !self.busy && !dirty && !branch.is_empty() && !self.rebase_onto.trim().is_empty(),
+                egui::Button::new("Load commits to edit"),
+            )
+            .clicked()
+        {
+            self.interactive_plan = None;
+            self.queue(Job::LoadInteractiveRebase(
+                self.rebase_onto.trim().to_owned(),
+            ));
+        }
+        if dirty {
+            ui.label(
+                RichText::new("Commit or stash local changes before interactive rebase.")
+                    .color(orange()),
+            );
+        }
+        if let Some(plan) = self.interactive_plan.as_mut() {
+            ui.add_space(8.0);
+            ui.label(format!("{} commits onto {}", plan.steps.len(), plan.target));
+            let mut move_to = None;
+            egui::ScrollArea::vertical()
+                .max_height(390.0)
+                .show(ui, |ui| {
+                    let count = plan.steps.len();
+                    for index in 0..count {
+                        let step = &mut plan.steps[index];
+                        ui.horizontal(|ui| {
+                            ui.monospace(&step.id[..7]);
+                            ui.label(&step.subject);
+                            egui::ComboBox::from_id_salt(("rebase_step", &step.id))
+                                .selected_text(step.action.label())
+                                .show_ui(ui, |ui| {
+                                    for action in [
+                                        git::RebaseAction::Pick,
+                                        git::RebaseAction::Squash,
+                                        git::RebaseAction::Reword,
+                                        git::RebaseAction::Drop,
+                                    ] {
+                                        ui.selectable_value(
+                                            &mut step.action,
+                                            action,
+                                            action.label(),
+                                        );
+                                    }
+                                });
+                            if ui.add_enabled(index > 0, egui::Button::new("↑")).clicked() {
+                                move_to = Some((index, index - 1));
+                            }
+                            if ui
+                                .add_enabled(index + 1 < count, egui::Button::new("↓"))
+                                .clicked()
+                            {
+                                move_to = Some((index, index + 1));
+                            }
+                        });
+                        if step.action == git::RebaseAction::Reword {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut step.message)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(3),
+                            );
+                        }
+                        ui.separator();
+                    }
+                });
+            if let Some((from, to)) = move_to {
+                plan.steps.swap(from, to);
+            }
+            let kept = plan
+                .steps
+                .iter()
+                .filter(|step| step.action != git::RebaseAction::Drop)
+                .count();
+            let first_squash = plan
+                .steps
+                .iter()
+                .find(|step| step.action != git::RebaseAction::Drop)
+                .is_some_and(|step| step.action == git::RebaseAction::Squash);
+            let blank_message = plan.steps.iter().any(|step| {
+                step.action == git::RebaseAction::Reword && step.message.trim().is_empty()
+            });
+            if first_squash {
+                ui.label(
+                    RichText::new("The first kept commit cannot be squashed.").color(orange()),
+                );
+            }
+            if blank_message {
+                ui.label(RichText::new("Reworded commits need a message.").color(orange()));
+            }
+            if ui
+                .add_enabled(
+                    !self.busy && !dirty && kept > 0 && !first_squash && !blank_message,
+                    egui::Button::new("Review interactive rebase..."),
+                )
+                .clicked()
+            {
+                self.confirm_interactive_rebase = true;
+            }
+        }
         ui.add_space(10.0);
         ui.label(
             RichText::new(
@@ -3722,6 +3898,38 @@ impl GitVibe {
                 self.queue(Job::ExportPatch(args, destination));
             }
         });
+        let hunk_count = git::diff_hunks(&self.detail).len();
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.diff_wrap, "Wrap lines");
+            if hunk_count > 0 {
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.diff_hunk_focus > 0,
+                        egui::Button::new("↑ Previous change"),
+                    )
+                    .clicked()
+                {
+                    self.diff_hunk_focus -= 1;
+                    self.diff_scroll_pending = true;
+                }
+                ui.label(format!(
+                    "{} / {}",
+                    self.diff_hunk_focus.min(hunk_count - 1) + 1,
+                    hunk_count
+                ));
+                if ui
+                    .add_enabled(
+                        self.diff_hunk_focus + 1 < hunk_count,
+                        egui::Button::new("Next change ↓"),
+                    )
+                    .clicked()
+                {
+                    self.diff_hunk_focus += 1;
+                    self.diff_scroll_pending = true;
+                }
+            }
+        });
         ui.add_space(12.0);
         if self.file_history_path.as_deref() == Some(&path) {
             ui.label(
@@ -4163,15 +4371,20 @@ impl GitVibe {
             } else {
                 Vec::new()
             };
-            egui::ScrollArea::both().show(ui, |ui| {
+            let scroll = if self.diff_wrap {
+                egui::ScrollArea::vertical()
+            } else {
+                egui::ScrollArea::both()
+            };
+            scroll.show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing.y = 2.0;
                 if hunks.is_empty() {
                     for line in self.detail.lines().take(2500) {
                         diff_line(ui, line);
                     }
                 } else {
-                    for hunk in hunks {
-                        egui::Frame::new()
+                    for (hunk_index, hunk) in hunks.into_iter().enumerate() {
+                        let heading = egui::Frame::new()
                             .fill(panel_alt())
                             .corner_radius(egui::CornerRadius::same(7))
                             .inner_margin(egui::Margin::symmetric(8, 5))
@@ -4187,6 +4400,17 @@ impl GitVibe {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
+                                            if !self.selected_file_staged
+                                                && ui
+                                                    .add_enabled(
+                                                        !self.busy,
+                                                        egui::Button::new("Discard hunk..."),
+                                                    )
+                                                    .clicked()
+                                            {
+                                                self.confirm_discard_hunk =
+                                                    Some(hunk.patch.clone());
+                                            }
                                             if ui
                                                 .add_enabled(
                                                     !self.busy,
@@ -4210,6 +4434,10 @@ impl GitVibe {
                                     );
                                 });
                             });
+                        if self.diff_scroll_pending && hunk_index == self.diff_hunk_focus {
+                            ui.scroll_to_rect(heading.response.rect, Some(egui::Align::Center));
+                            self.diff_scroll_pending = false;
+                        }
                         let numbers = hunk.line_numbers();
                         for (index, line) in hunk.lines.iter().enumerate().take(400) {
                             let counterpart = if line.starts_with('+') {
@@ -4257,7 +4485,7 @@ impl GitVibe {
                                     ui.add_space(51.0);
                                 }
                                 let (old, new) = numbers[index];
-                                diff_line_numbered(ui, line, old, new, counterpart);
+                                diff_line_numbered(ui, line, old, new, counterpart, self.diff_wrap);
                             });
                         }
                         ui.add_space(9.0);
@@ -4829,6 +5057,27 @@ impl GitVibe {
                 });
             self.show_clone &= open;
         }
+        if let Some(patch) = self.confirm_discard_hunk.clone() {
+            egui::Window::new("Discard this hunk?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label("Discard the selected unstaged lines? This cannot be undone.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_discard_hunk = None;
+                        }
+                        if ui
+                            .add(egui::Button::new("Discard hunk").fill(red()))
+                            .clicked()
+                        {
+                            self.hunk_action = true;
+                            self.queue(Job::DiscardHunk(patch));
+                            self.confirm_discard_hunk = None;
+                        }
+                    });
+                });
+        }
         if let Some(path) = self.confirm_discard.clone() {
             egui::Window::new("Discard changes?")
                 .collapsible(false)
@@ -5050,6 +5299,37 @@ impl GitVibe {
                         {
                             self.git_owned(vec!["remote".into(), "remove".into(), remote]);
                             self.confirm_remove_remote = None;
+                        }
+                    });
+                });
+        }
+        if self.confirm_interactive_rebase {
+            egui::Window::new("Start interactive rebase?")
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if let Some(plan) = &self.interactive_plan {
+                        ui.label(format!(
+                            "Replay {} commits onto {}?",
+                            plan.steps.len(),
+                            plan.target
+                        ));
+                        ui.label(
+                            "This rewrites commit IDs. The old branch tip remains in the reflog.",
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_interactive_rebase = false;
+                        }
+                        if ui
+                            .add(egui::Button::new("Start rebase").fill(orange()))
+                            .clicked()
+                        {
+                            if let Some(plan) = self.interactive_plan.take() {
+                                self.queue(Job::StartInteractiveRebase(plan));
+                            }
+                            self.confirm_interactive_rebase = false;
                         }
                     });
                 });
@@ -5335,6 +5615,7 @@ fn diff_line_numbered(
     old: Option<usize>,
     new: Option<usize>,
     other: Option<&str>,
+    wrap: bool,
 ) {
     let added = line.starts_with('+');
     let removed = line.starts_with('-');
@@ -5417,7 +5698,11 @@ fn diff_line_numbered(
                 } else {
                     append_code_highlight(&mut job, content, color, Color32::TRANSPARENT);
                 }
-                ui.add(egui::Label::new(job).selectable(true));
+                ui.add(egui::Label::new(job).selectable(true).wrap_mode(if wrap {
+                    egui::TextWrapMode::Wrap
+                } else {
+                    egui::TextWrapMode::Extend
+                }));
             });
         });
 }
