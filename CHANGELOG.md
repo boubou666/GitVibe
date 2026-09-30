@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-30
+
+### Added
+
+- Repository tabs with remembered open projects, a closable Changelog tab, and a full-width repository manager with favorites and search.
+- Aurora, Cosmic, and Ember themes, saved between launches.
+- Search across the complete history of all refs by commit message, author, or SHA, including commits beyond the loaded graph.
+- Structured file history with revision diffs and file previews, plus changed-file lists in the commit inspector.
+- Numbered diff lines with highlighted edits and individual line staging and unstaging.
+- A visual conflict editor for selecting lines from either side, editing the result, and staging the resolved file.
+- A New Tab page for opening, cloning, and creating repositories, plus repository and branch pickers in the top bar.
+- A repository shell dock with command history, working directory navigation, and PowerShell or POSIX shell commands.
+- A regression test for repositories whose `.git` file points to metadata stored outside the working tree.
+- A two-column clone dialog with source URL presets, destination browsing, shallow clone, and sparse checkout.
+
+### Changed
+
+- Reworked the workspace around a compact top action bar, branch and remote rail, dense uncapped graph, wide diff view, and a right-hand changes and commit panel.
+- Render graph lanes without the previous nine-lane limit, with horizontal scrolling for wide merge histories.
+- Tightened the desktop layout around flat repository tabs, a narrower branch rail, a graphite theme, aligned graph columns, compact change rows, and a docked Git console.
+- Select the newest commit when opening a repository so its details appear immediately.
+- Replaced stock tab controls with one aligned tab strip, applied dark styling to popup menus and text fields, and enabled a dark Windows title bar.
+- Grouped local and remote branches in the rail with a filter; clicking a branch returns to its graph commit.
+- Added a commit right-click menu for checkout, creating branches and tags, reset, cherry-pick, revert, comparisons, and copying the SHA.
+- Moved commit patches into a wide center view so the inspector stays focused on commit details and changed files.
+- Rendered commit patches by file and hunk with line numbers; selecting a changed file opens its patch in the center view.
+- Added inline branch naming at a commit, author badges and names in the graph, collapsible branch groups, and double-click branch switching with choices for local changes.
+- Added pull-mode choices to the toolbar arrow and centered the Git actions.
+- Improved working-tree diff rows with syntax cues, full-width change highlights, and compact hunk controls.
+- Fixed zoom growth across launches, aligned repository action button heights, and highlighted the selected file in both inspector lists.
+
 ## [0.5.0] - 2026-09-30
 
 ### Added
@@ -59,7 +90,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/boubou666/GitVibe/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/boubou666/GitVibe/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/boubou666/GitVibe/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/boubou666/GitVibe/compare/v0.2.0...v0.3.0
