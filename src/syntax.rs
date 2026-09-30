@@ -16,6 +16,7 @@ pub struct Span {
     pub color: Color32,
 }
 
+#[derive(Default)]
 pub struct HunkColors {
     old: HashMap<usize, Vec<Span>>,
     new: HashMap<usize, Vec<Span>>,

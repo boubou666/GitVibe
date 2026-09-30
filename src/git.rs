@@ -42,6 +42,65 @@ pub struct Submodule {
     pub initialized: bool,
 }
 
+#[derive(Clone, Default)]
+pub struct LfsStatus {
+    pub version: String,
+    pub patterns: Vec<LfsPattern>,
+    pub files: Vec<LfsFile>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+pub struct LfsPattern {
+    pub pattern: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub lockable: bool,
+    #[serde(default)]
+    pub tracked: bool,
+}
+
+#[derive(Clone, serde::Deserialize)]
+pub struct LfsFile {
+    pub name: String,
+    #[serde(default)]
+    pub oid: String,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct LfsPatterns {
+    #[serde(default)]
+    patterns: Vec<LfsPattern>,
+}
+
+#[derive(serde::Deserialize)]
+struct LfsFiles {
+    #[serde(default)]
+    files: Option<Vec<LfsFile>>,
+}
+
+pub fn lfs_status(repo: &Path) -> Result<Option<LfsStatus>, String> {
+    let version = match run(repo, &["lfs", "version"]) {
+        Ok(version) => version,
+        Err(error) if error.contains("not a git command") => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let patterns = serde_json::from_str::<LfsPatterns>(&run(repo, &["lfs", "track", "--json"])?)
+        .map_err(|error| format!("Could not read Git LFS tracked patterns: {error}"))?
+        .patterns;
+    let files = serde_json::from_str::<LfsFiles>(&run(repo, &["lfs", "ls-files", "--json"])?)
+        .map_err(|error| format!("Could not read Git LFS files: {error}"))?
+        .files
+        .unwrap_or_default();
+    Ok(Some(LfsStatus {
+        version,
+        patterns,
+        files,
+    }))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RebaseAction {
     Pick,
@@ -1579,6 +1638,31 @@ mod tests {
 
     fn snapshot(repo: &Path) -> Result<Snapshot, String> {
         snapshot_with_limit(repo, 300)
+    }
+
+    #[test]
+    fn reads_lfs_patterns_and_empty_file_list() {
+        if run(Path::new("."), &["lfs", "version"]).is_err() {
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("gitvibe-lfs-{}-{unique}", std::process::id()));
+        let root = init(&root).unwrap();
+        run(&root, &["lfs", "track", "*.psd"]).unwrap();
+        let status = lfs_status(&root).unwrap().unwrap();
+        assert!(status.version.starts_with("git-lfs/"));
+        assert_eq!(status.patterns.len(), 1);
+        assert_eq!(status.patterns[0].pattern, "*.psd");
+        assert!(status.patterns[0].tracked);
+        assert!(status.files.is_empty());
+        assert!(root.join(".gitattributes").exists());
+        run(&root, &["lfs", "untrack", "*.psd"]).unwrap();
+        assert!(lfs_status(&root).unwrap().unwrap().patterns.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
