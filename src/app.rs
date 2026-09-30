@@ -7971,12 +7971,19 @@ impl eframe::App for GitVibe {
                         .inner_margin(egui::Margin::same(8)),
                 )
                 .show(ui, |ui| {
-                    let body_height = (ui.available_height() - 220.0).max(100.0);
+                    let sidebar_height = ui.available_height();
+                    let footer_height = (sidebar_height * 0.55).min(330.0);
+                    let body_height = sidebar_height - footer_height;
                     egui::ScrollArea::vertical()
+                        .id_salt("sidebar_branches")
                         .max_height(body_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| self.sidebar(ui));
-                    self.sidebar_footer(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("sidebar_pages")
+                        .max_height(ui.available_height())
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| self.sidebar_footer(ui));
                 });
         }
         if repository_view {
