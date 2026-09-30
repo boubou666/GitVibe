@@ -10,16 +10,17 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Inspect Git LFS tracked patterns and checkout files, initialize local filters, track or untrack root rules, and pull LFS objects when Git LFS is installed.
 - Keep multiple repositories open in tabs, pin favorites, search recent repositories, and restore window placement. The Changelog tab can be closed and reopened from the `+` menu.
 - Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
+- Set a commit name and email at first launch. Manage multiple author profiles in Preferences from the top-right header and switch the active profile there. GitVibe uses the selected identity for its commits; global `.gitconfig` synchronization is optional and off by default.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
 - Open the local diagnostic log folder from Updates when reporting an app error or crash. Logs rotate at 2 MB, omit command arguments, and redact URL user credentials; review a log before sharing it because error messages may contain repository paths.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
 - Right-click a commit for checkout, branch and tag creation, reset, cherry-pick, revert, comparisons, and SHA copying. Commit patches open in the center pane.
-- Review numbered unified or side by side diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes. Open a selected working-tree file in its default external editor. External working-tree edits appear automatically while a repository is open.
+- Review numbered unified or side by side diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes. Ctrl/Cmd+click selects multiple changed files for context-menu actions. Open a selected working-tree file in its default app or show it in the system file manager. External working-tree edits appear automatically while a repository is open.
 - Export a commit or changed file as a patch and apply a patch from disk.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.
 - Restore a clean file from a selected commit into the working tree and staging area; local edits to that file block the restore.
-- Apply a configured commit template to a draft and add a co-author trailer from the commit form.
+- Apply a configured commit template to a draft and commit with the active author profile.
 - Cherry-pick and revert non-merge commits with confirmation.
 - Create and switch branches, track remote branches, merge branches, and create tags.
 - Add and remove remotes and create annotated tags.

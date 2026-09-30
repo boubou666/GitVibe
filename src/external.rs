@@ -5,6 +5,33 @@ pub fn edit_file(repo: &Path, relative: &str) -> Result<(), String> {
     open_default(&path)
 }
 
+pub fn show_in_folder(repo: &Path, relative: &str) -> Result<(), String> {
+    let path = resolve_file(repo, relative)?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()
+            .map_err(|error| format!("Could not show this file in Explorer: {error}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&path)
+            .spawn()
+            .map_err(|error| format!("Could not show this file in Finder: {error}"))?;
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path.parent().expect("resolved file has a parent"))
+            .spawn()
+            .map_err(|error| format!("Could not show this file in the file manager: {error}"))?;
+    }
+    Ok(())
+}
+
 fn resolve_file(repo: &Path, relative: &str) -> Result<PathBuf, String> {
     let relative = Path::new(relative);
     if relative.is_absolute()
