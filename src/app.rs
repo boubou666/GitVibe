@@ -2799,7 +2799,7 @@ impl GitVibe {
         ui.add_space(5.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             for worktree in worktrees {
-                let is_current = worktree.path == current_root;
+                let is_current = worktree.current;
                 egui::Frame::new()
                     .fill(panel())
                     .stroke(Stroke::new(1.0, border()))

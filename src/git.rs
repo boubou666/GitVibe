@@ -27,6 +27,7 @@ pub struct Worktree {
     pub path: PathBuf,
     pub head: String,
     pub branch: Option<String>,
+    pub current: bool,
     pub locked: bool,
     pub prunable: bool,
 }
@@ -658,6 +659,7 @@ pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
                 path: PathBuf::from(path),
                 head: String::new(),
                 branch: None,
+                current: false,
                 locked: false,
                 prunable: false,
             });
@@ -675,6 +677,14 @@ pub fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
     }
     if let Some(worktree) = current {
         result.push(worktree);
+    }
+    let canonical_repo = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
+    for worktree in &mut result {
+        worktree.current = worktree
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| worktree.path.clone())
+            == canonical_repo;
     }
     Ok(result)
 }
@@ -1192,11 +1202,10 @@ mod tests {
         .unwrap();
         let listed = worktrees(&root).unwrap();
         assert_eq!(listed.len(), 2);
-        assert!(
-            listed
-                .iter()
-                .any(|tree| tree.path == linked && tree.branch.as_deref() == Some("linked-test"))
-        );
+        assert!(listed.iter().any(|tree| tree.path.canonicalize().unwrap()
+            == linked.canonicalize().unwrap()
+            && tree.branch.as_deref() == Some("linked-test")));
+        assert_eq!(listed.iter().filter(|tree| tree.current).count(), 1);
         assert!(linked.join(".git").is_file());
 
         let child = init(&base.join("child source")).unwrap();
