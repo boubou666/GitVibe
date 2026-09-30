@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-09-30
+
+### Added
+
+- File-aware syntax highlighting in working-tree and commit diffs, using separate parser state for the old and new sides of each hunk. Unknown file types keep the existing readable fallback.
+- Alt+Up and Alt+Down to select changed files without using the mouse; selection scrolls into view in the Changes panel.
+
 ## [0.11.0] - 2026-09-30
 
 ### Added
