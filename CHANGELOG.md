@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-30
+
+### Added
+
+- Searchable command palette for repository pages and actions, opened with Ctrl/Cmd+K or the toolbar.
+- Ctrl/Cmd+Tab and Ctrl/Cmd+Shift+Tab to cycle repository tabs.
+- Up and Down arrows to select commits in the graph, scrolling the selection into view.
+- Ctrl/Cmd+Shift+S and Ctrl/Cmd+Shift+U to stage or unstage the selected file, plus stage-all commands in the palette.
+
 ## [0.9.0] - 2026-09-30
 
 ### Added

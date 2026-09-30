@@ -168,6 +168,78 @@ enum Page {
     Updates,
 }
 
+#[derive(Clone, Copy)]
+enum PaletteAction {
+    Show(Page),
+    SearchHistory,
+    Refresh,
+    Fetch,
+    Pull,
+    Push,
+    ToggleTerminal,
+    StageSelected,
+    UnstageSelected,
+    StageAll,
+    UnstageAll,
+}
+
+impl PaletteAction {
+    fn needs_repository(self) -> bool {
+        !matches!(
+            self,
+            Self::Show(Page::Repositories | Page::NewTab | Page::Changelog)
+        )
+    }
+
+    fn needs_idle(self) -> bool {
+        matches!(
+            self,
+            Self::Refresh
+                | Self::Fetch
+                | Self::Pull
+                | Self::Push
+                | Self::StageSelected
+                | Self::UnstageSelected
+                | Self::StageAll
+                | Self::UnstageAll
+        )
+    }
+}
+
+const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
+    (
+        "Open repository manager",
+        PaletteAction::Show(Page::Repositories),
+    ),
+    ("New tab", PaletteAction::Show(Page::NewTab)),
+    ("View history", PaletteAction::Show(Page::History)),
+    ("View changes", PaletteAction::Show(Page::Changes)),
+    ("Search commits", PaletteAction::SearchHistory),
+    ("Branches and tags", PaletteAction::Show(Page::Branches)),
+    ("Worktrees", PaletteAction::Show(Page::Worktrees)),
+    ("Submodules", PaletteAction::Show(Page::Submodules)),
+    ("Rebase", PaletteAction::Show(Page::Rebase)),
+    ("Stashes", PaletteAction::Show(Page::Stashes)),
+    ("Pull requests", PaletteAction::Show(Page::PullRequests)),
+    ("Terminal", PaletteAction::ToggleTerminal),
+    (
+        "Stage selected file · Ctrl/Cmd+Shift+S",
+        PaletteAction::StageSelected,
+    ),
+    (
+        "Unstage selected file · Ctrl/Cmd+Shift+U",
+        PaletteAction::UnstageSelected,
+    ),
+    ("Stage all changes", PaletteAction::StageAll),
+    ("Unstage all changes", PaletteAction::UnstageAll),
+    ("Refresh repository", PaletteAction::Refresh),
+    ("Fetch all", PaletteAction::Fetch),
+    ("Pull", PaletteAction::Pull),
+    ("Push", PaletteAction::Push),
+    ("Updates", PaletteAction::Show(Page::Updates)),
+    ("Changelog", PaletteAction::Show(Page::Changelog)),
+];
+
 #[derive(Clone)]
 enum UpdateState {
     Checking,
@@ -342,6 +414,11 @@ pub struct GitVibe {
     notice: String,
     error: String,
     search: String,
+    palette_open: bool,
+    palette_query: String,
+    palette_index: usize,
+    palette_focus: bool,
+    graph_scroll_pending: bool,
     search_results: Vec<git::Commit>,
     search_more: bool,
     search_active: bool,
@@ -556,6 +633,11 @@ impl GitVibe {
             notice: String::new(),
             error: String::new(),
             search: String::new(),
+            palette_open: false,
+            palette_query: String::new(),
+            palette_index: 0,
+            palette_focus: false,
+            graph_scroll_pending: false,
             search_results: Vec::new(),
             search_more: false,
             search_active: false,
@@ -1201,7 +1283,7 @@ impl GitVibe {
                     .color(if count == 0 { accent() } else { orange() }),
                 );
             }
-            let toolbar_width = 480.0;
+            let toolbar_width = 555.0;
             ui.add_space(
                 (ui.max_rect().center().x - ui.cursor().left() - toolbar_width / 2.0).max(8.0),
             );
@@ -1257,6 +1339,9 @@ impl GitVibe {
                         self.queue(Job::Refresh);
                     }
                 });
+                if toolbar_action(ui, "Commands") {
+                    self.open_palette();
+                }
                 if self.busy {
                     ui.spinner();
                 }
@@ -1270,6 +1355,178 @@ impl GitVibe {
             PullMode::Merge => self.git(&["pull", "--no-rebase"]),
             PullMode::FastForwardOnly => self.git(&["pull", "--ff-only"]),
             PullMode::Rebase => self.git(&["pull", "--rebase"]),
+        }
+    }
+
+    fn open_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_query.clear();
+        self.palette_index = 0;
+        self.palette_focus = true;
+    }
+
+    fn run_palette_action(&mut self, action: PaletteAction, ctx: &egui::Context) {
+        match action {
+            PaletteAction::Show(Page::NewTab) => {
+                self.new_tab_open = true;
+                self.page = Page::NewTab;
+            }
+            PaletteAction::Show(Page::Changelog) => {
+                self.changelog_open = true;
+                self.page = Page::Changelog;
+            }
+            PaletteAction::Show(page) => self.page = page,
+            PaletteAction::SearchHistory => {
+                self.page = Page::History;
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("history_search")));
+            }
+            PaletteAction::Refresh => self.queue(Job::Refresh),
+            PaletteAction::Fetch => self.git(&["fetch", "--all", "--prune"]),
+            PaletteAction::Pull => self.run_pull_mode(),
+            PaletteAction::Push => self.git(&["push"]),
+            PaletteAction::ToggleTerminal => self.terminal_open = !self.terminal_open,
+            PaletteAction::StageSelected => {
+                if let Some(path) = self.selected_file.clone() {
+                    self.git_owned(vec!["add".into(), "--".into(), path]);
+                    self.selected_file_staged = true;
+                    self.detail.clear();
+                }
+            }
+            PaletteAction::UnstageSelected => {
+                if let Some(path) = self.selected_file.clone() {
+                    if self
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.commits.is_empty())
+                    {
+                        self.git_owned(vec!["rm".into(), "--cached".into(), "--".into(), path]);
+                    } else {
+                        self.git_owned(vec![
+                            "restore".into(),
+                            "--staged".into(),
+                            "--".into(),
+                            path,
+                        ]);
+                    }
+                    self.selected_file_staged = false;
+                    self.detail.clear();
+                }
+            }
+            PaletteAction::StageAll => self.git(&["add", "-A"]),
+            PaletteAction::UnstageAll => {
+                if self
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.commits.is_empty())
+                {
+                    self.git(&["rm", "-r", "--cached", "--", "."]);
+                } else {
+                    self.git(&["restore", "--staged", "."]);
+                }
+            }
+        }
+    }
+
+    fn command_palette(&mut self, ctx: &egui::Context) {
+        if !self.palette_open {
+            return;
+        }
+        let mut close = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut chosen = None;
+        egui::Window::new("Commands")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 82.0])
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                let search = ui.add(
+                    egui::TextEdit::singleline(&mut self.palette_query)
+                        .hint_text("Search commands")
+                        .desired_width(460.0),
+                );
+                if self.palette_focus {
+                    search.request_focus();
+                    self.palette_focus = false;
+                }
+                if search.changed() {
+                    self.palette_index = 0;
+                }
+                let query = self.palette_query.trim().to_lowercase();
+                let matches = PALETTE_ACTIONS
+                    .iter()
+                    .copied()
+                    .filter(|(label, action)| {
+                        (!action.needs_repository() || self.repo.is_some())
+                            && match action {
+                                PaletteAction::StageSelected => {
+                                    self.selected_file.is_some() && !self.selected_file_staged
+                                }
+                                PaletteAction::UnstageSelected => {
+                                    self.selected_file.is_some() && self.selected_file_staged
+                                }
+                                PaletteAction::StageAll => {
+                                    self.snapshot.as_ref().is_some_and(|snapshot| {
+                                        snapshot.status.iter().any(git::FileStatus::unstaged)
+                                    })
+                                }
+                                PaletteAction::UnstageAll => {
+                                    self.snapshot.as_ref().is_some_and(|snapshot| {
+                                        snapshot.status.iter().any(git::FileStatus::staged)
+                                    })
+                                }
+                                _ => true,
+                            }
+                            && label.to_lowercase().contains(&query)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.is_empty() {
+                    ui.label(RichText::new("No matching commands").color(muted()));
+                    return;
+                }
+                self.palette_index = self.palette_index.min(matches.len() - 1);
+                if ui.input(|input| input.key_pressed(egui::Key::ArrowDown)) {
+                    self.palette_index = (self.palette_index + 1).min(matches.len() - 1);
+                }
+                if ui.input(|input| input.key_pressed(egui::Key::ArrowUp)) {
+                    self.palette_index = self.palette_index.saturating_sub(1);
+                }
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(410.0)
+                    .show(ui, |ui| {
+                        for (index, (label, action)) in matches.iter().enumerate() {
+                            let enabled = !action.needs_idle() || !self.busy;
+                            if ui
+                                .add_enabled(
+                                    enabled,
+                                    egui::Button::new(*label)
+                                        .selected(index == self.palette_index)
+                                        .min_size(egui::vec2(ui.available_width(), 25.0)),
+                                )
+                                .clicked()
+                            {
+                                chosen = Some(*action);
+                            }
+                        }
+                    });
+                if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                    let action = matches[self.palette_index].1;
+                    if !action.needs_idle() || !self.busy {
+                        chosen = Some(action);
+                    }
+                }
+                ui.label(
+                    RichText::new("↑ ↓ to choose · Enter to run · Esc to close")
+                        .small()
+                        .color(muted()),
+                );
+            });
+        if let Some(action) = chosen {
+            self.run_palette_action(action, ctx);
+            close = true;
+        }
+        if close {
+            self.palette_open = false;
         }
     }
 
@@ -1937,6 +2194,12 @@ impl GitVibe {
                         if response.clicked() {
                             self.select_commit(&commit.id);
                         }
+                        if self.graph_scroll_pending
+                            && self.selected_commit.as_deref() == Some(&commit.id)
+                        {
+                            ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                            self.graph_scroll_pending = false;
+                        }
                         response.context_menu(|ui| self.commit_context_menu(ui, commit));
                         self.inline_branch_editor(ui, commit, response.rect);
                         response.on_hover_text(format!(
@@ -2024,6 +2287,12 @@ impl GitVibe {
                     );
                     if response.clicked() {
                         self.select_commit(&commit.id);
+                    }
+                    if self.graph_scroll_pending
+                        && self.selected_commit.as_deref() == Some(&commit.id)
+                    {
+                        ui.scroll_to_rect(response.rect, Some(egui::Align::Center));
+                        self.graph_scroll_pending = false;
                     }
                     response.context_menu(|ui| self.commit_context_menu(ui, commit));
                     self.inline_branch_editor(ui, commit, response.rect);
@@ -5590,9 +5859,92 @@ impl eframe::App for GitVibe {
         let ctx = ui.ctx().clone();
         self.poll();
         self.poll_updates();
-        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F)) {
+        if !self.palette_open
+            && ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::F))
+        {
             self.page = Page::History;
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("history_search")));
+        }
+        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::K)) {
+            self.open_palette();
+        }
+        if self.page == Page::Changes
+            && !self.palette_open
+            && !self.busy
+            && ctx.input(|input| {
+                input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::S)
+            })
+            && self.selected_file.is_some()
+            && !self.selected_file_staged
+        {
+            self.run_palette_action(PaletteAction::StageSelected, &ctx);
+        }
+        if self.page == Page::Changes
+            && !self.palette_open
+            && !self.busy
+            && ctx.input(|input| {
+                input.modifiers.command && input.modifiers.shift && input.key_pressed(egui::Key::U)
+            })
+            && self.selected_file.is_some()
+            && self.selected_file_staged
+        {
+            self.run_palette_action(PaletteAction::UnstageSelected, &ctx);
+        }
+        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Tab))
+            && !self.palette_open
+            && !self.busy
+            && self.open_repo_tabs.len() > 1
+        {
+            let current = self
+                .repo
+                .as_ref()
+                .and_then(|repo| self.open_repo_tabs.iter().position(|tab| tab == repo))
+                .unwrap_or(0);
+            let backwards = ctx.input(|input| input.modifiers.shift);
+            let next = if backwards {
+                (current + self.open_repo_tabs.len() - 1) % self.open_repo_tabs.len()
+            } else {
+                (current + 1) % self.open_repo_tabs.len()
+            };
+            self.page = Page::History;
+            self.queue(Job::Open(self.open_repo_tabs[next].clone()));
+        }
+        if self.page == Page::History
+            && !self.palette_open
+            && !self.busy
+            && !ctx.text_edit_focused()
+        {
+            let direction = ctx.input(|input| {
+                if input.key_pressed(egui::Key::ArrowDown) {
+                    1_i32
+                } else if input.key_pressed(egui::Key::ArrowUp) {
+                    -1_i32
+                } else {
+                    0
+                }
+            });
+            if direction != 0 {
+                let commits = if self.search_active {
+                    Some(&self.search_results)
+                } else {
+                    self.snapshot.as_ref().map(|snapshot| &snapshot.commits)
+                };
+                if let Some(commits) = commits.filter(|commits| !commits.is_empty()) {
+                    let current = self
+                        .selected_commit
+                        .as_ref()
+                        .and_then(|id| commits.iter().position(|commit| &commit.id == id))
+                        .unwrap_or(0);
+                    let next = if direction > 0 {
+                        (current + 1).min(commits.len() - 1)
+                    } else {
+                        current.saturating_sub(1)
+                    };
+                    let id = commits[next].id.clone();
+                    self.select_commit(&id);
+                    self.graph_scroll_pending = true;
+                }
+            }
         }
         if ctx.input(|input| input.key_pressed(egui::Key::F5)) && !self.busy && self.repo.is_some()
         {
@@ -5744,6 +6096,7 @@ impl eframe::App for GitVibe {
                 Page::Console => self.console(ui),
                 Page::Updates => self.updates_page(ui),
             });
+        self.command_palette(&ctx);
         self.dialogs(&ctx);
         self.launch(&ctx);
     }
