@@ -11,9 +11,10 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 - Keep multiple repositories open in tabs, pin favorites, search recent repositories, and restore window placement. The Changelog tab can be closed and reopened from the `+` menu.
 - Choose between Aurora, Cosmic, and Ember themes; the selection persists between launches.
 - Check for new releases on launch or from the Updates screen. Download a platform package with SHA-256 verification; Windows can launch the installer directly from the app.
+- Open the local diagnostic log folder from Updates when reporting an app error or crash. Logs rotate at 2 MB, omit command arguments, and redact URL user credentials; review a log before sharing it because error messages may contain repository paths.
 - Inspect a colored commit graph with local and remote refs, load older commits in batches, search all history, view commit files, and compare any two commits. Wide merge graphs scroll horizontally.
 - Right-click a commit for checkout, branch and tag creation, reset, cherry-pick, revert, comparisons, and SHA copying. Commit patches open in the center pane.
-- Review numbered diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes.
+- Review numbered unified or side by side diffs with highlighted edits and optional syntax colors that carry parser state across distant hunks; stage or unstage files, individual text hunks, or lines; discard edits and commit changes. External working-tree edits appear automatically while a repository is open.
 - Export a commit or changed file as a patch and apply a patch from disk.
 - Resolve text conflicts visually by selecting individual lines from ours and theirs or editing each result block. Whole-file choices, external editing, merge completion, and merge abort remain available.
 - Browse structured file history, view a revision diff or file content, and inspect blame and commit patches.
@@ -32,7 +33,7 @@ GitVibe is a native desktop Git client written in Rust for Windows, Linux, and m
 
 The visual history initially loads the most recent 300 commits across local and remote refs; use "Load 300 more commits" at the bottom of the graph to extend it. Search scans the full history across all refs and shows the first 300 matches. Hunk and line actions apply to text diffs; binary files and untracked files still use whole-file staging. The visual conflict editor accepts UTF-8 text files up to 2 MB; whole-file choices and external editing remain available for other files. During a rebase, Git's ours/theirs meaning differs from an ordinary merge. The Rebase page can edit a linear sequence of up to 40 commits. The terminal runs one command at a time and does not yet provide a PTY for interactive full-screen programs or editor prompts.
 
-Press Ctrl/Cmd+K for the command palette, Ctrl/Cmd+Tab to cycle repository tabs (add Shift to reverse direction), Ctrl/Cmd+F to search commits, and F5 to refresh. With the history graph active, Up and Down select commits. In Changes, Alt+Up and Alt+Down select changed files; Ctrl/Cmd+Shift+S stages the selected file and Ctrl/Cmd+Shift+U unstages it. Undo and Redo in the toolbar, or Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z outside text fields, replay recent staging changes only. GitVibe checks the repository, branch, commit, and index before replaying; working files are left alone. Working-tree and commit diffs apply file-aware syntax colors where the file type is recognized. Native builds enable AccessKit for assistive technology, with labeled repository tabs and branch rows.
+Press Ctrl/Cmd+K for the command palette, Ctrl/Cmd+Tab to cycle repository tabs (add Shift to reverse direction), Ctrl/Cmd+F to search commits, and F5 to refresh. With the history graph active, Up and Down select commits. In Changes, Alt+Up and Alt+Down select changed files; Ctrl/Cmd+Shift+S stages the selected file and Ctrl/Cmd+Shift+U unstages it. Undo and Redo in the toolbar, or Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z (Ctrl/Cmd+Y also redoes) outside text fields, replay recent staging actions and unpublished ordinary commits. GitVibe checks the repository, branch, HEAD, and index before replaying and guards commit undo against known remote refs; working files are left alone. Working-tree and commit diffs apply file-aware syntax colors where the file type is recognized. Native builds enable AccessKit for assistive technology, with labeled repository tabs and branch rows.
 
 The diamond beside the branch picker checks whether the committed branch tips can merge with a chosen target. Target choices are saved per repository. The check lists conflicting files without changing the index or working tree; uncommitted edits are outside its scope.
 
@@ -41,14 +42,14 @@ The diamond beside the branch picker checks whether the committed branch tips ca
 Git must be installed and available on `PATH` on every platform. The [Desktop builds workflow](.github/workflows/desktop.yml) compiles and tests Windows, Linux, and macOS builds and uploads platform packages for each run. Linux folder dialogs use an XDG Desktop Portal backend or Zenity.
 
 - **Windows:** Download `GitVibe-windows-X64-setup.exe` from the [latest release](https://github.com/boubou666/GitVibe/releases/latest). The per-user installer adds a Start Menu shortcut and an uninstaller without asking for administrator rights. A portable zip remains available.
-- **Linux:** Extract the Linux archive and run `./gitvibe`. A desktop session with X11 or Wayland and OpenGL support is required.
+- **Linux:** Extract the Linux archive and run `./gitvibe`. The archive also contains `gitvibe.png` and a `.desktop` launcher for desktop integration. A desktop session with X11 or Wayland and OpenGL support is required.
 - **macOS:** Choose the ARM64 archive for Apple Silicon or the X64 archive for Intel. Extract it and open `GitVibe.app`.
 
 The Updates screen checks GitHub's latest published release automatically at startup and when you click **Check for updates**. Downloads are checked against the release asset's SHA-256 digest before they can be opened. On Windows, **Install update** starts the installer and closes GitVibe; finish the setup wizard to replace an existing installation. When updating from the portable zip, the installer creates a separate per-user installation, which you can then open from the Start Menu. On Linux and macOS, GitVibe opens the downloaded archive so you can replace the app manually. Current installers and macOS bundles are unsigned; Windows SmartScreen or macOS Gatekeeper may show a warning.
 
 ## Build from source
 
-Prerequisites: stable Rust (1.97 or newer) and Git on `PATH`. On Linux, install the desktop development libraries listed in the [eframe setup guide](https://github.com/emilk/egui/blob/main/crates/eframe/README.md#linux).
+Prerequisites: stable Rust (1.97 or newer) and Git on `PATH`. Windows MSVC builds also need the Windows SDK resource compiler for the embedded executable icon. On Linux, install the desktop development libraries listed in the [eframe setup guide](https://github.com/emilk/egui/blob/main/crates/eframe/README.md#linux).
 
 ```sh
 cargo run --release
@@ -77,7 +78,7 @@ Discarding working tree changes asks for confirmation. Hard reset also requires 
 
 ## Development plan
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes undo and redo, deeper accessibility, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the feature gaps to close toward a full GitKraken-like workflow. Notable upcoming work includes broader undo and redo, deeper accessibility, remote hosting integrations, signed installers, and automatic replacement on Linux and macOS. Release maintainers should follow [docs/RELEASING.md](docs/RELEASING.md).
 
 ## License
 

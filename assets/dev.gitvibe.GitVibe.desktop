@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GitVibe
+Comment=Visual Git desktop client
+Exec=gitvibe
+Icon=gitvibe
+Categories=Development;RevisionControl;
+Terminal=false

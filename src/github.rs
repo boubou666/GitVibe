@@ -17,7 +17,13 @@ pub struct PullRequest {
 }
 
 fn gh(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("gh")
+    let mut command = Command::new("gh");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .current_dir(repo)
         .args(args)
         .env("GH_PROMPT_DISABLED", "1")

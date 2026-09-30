@@ -266,6 +266,16 @@ pub struct IndexChange {
 }
 
 #[derive(Clone)]
+pub struct CommitChange {
+    pub repo: PathBuf,
+    pub branch: String,
+    pub before: String,
+    pub after: String,
+    pub index_tree: String,
+    pub label: String,
+}
+
+#[derive(Clone)]
 pub struct MergeCheck {
     pub target: String,
     pub head: String,
@@ -393,6 +403,96 @@ where
         }
     });
     Ok((output, change))
+}
+
+pub fn with_commit_history<F>(
+    repo: &Path,
+    operation: F,
+) -> Result<(String, Option<CommitChange>), String>
+where
+    F: FnOnce() -> Result<String, String>,
+{
+    let before = index_state(repo).ok();
+    let output = operation()?;
+    let after = index_state(repo).ok();
+    let change = before.zip(after).and_then(|(before, after)| {
+        if before.head == "<unborn>"
+            || before.branch == "<detached>"
+            || before.branch != after.branch
+            || before.head == after.head
+            || before.tree != after.tree
+        {
+            return None;
+        }
+        let parents = run(repo, &["rev-list", "--parents", "-n", "1", &after.head]).ok()?;
+        if parents.split_whitespace().collect::<Vec<_>>()
+            != vec![after.head.as_str(), before.head.as_str()]
+        {
+            return None;
+        }
+        let committed_tree = run(repo, &["rev-parse", &format!("{}^{{tree}}", after.head)]).ok()?;
+        if committed_tree != after.tree {
+            return None;
+        }
+        Some(CommitChange {
+            repo: repo.to_path_buf(),
+            branch: before.branch,
+            before: before.head,
+            after: after.head,
+            index_tree: after.tree,
+            label: "Commit changes".into(),
+        })
+    });
+    Ok((output, change))
+}
+
+pub fn replay_commit_change(
+    repo: &Path,
+    change: &CommitChange,
+    redo: bool,
+) -> Result<String, String> {
+    if repo != change.repo {
+        return Err("This commit action belongs to another repository".into());
+    }
+    let current = index_state(repo)?;
+    let (expected, target, action) = if redo {
+        (&change.before, &change.after, "Redo commit")
+    } else {
+        (&change.after, &change.before, "Undo commit")
+    };
+    if current.branch != change.branch || &current.head != expected {
+        return Err("Branch history changed; this commit can no longer be replayed".into());
+    }
+    if current.tree != change.index_tree {
+        return Err("The index changed since this commit. Refresh before changing history.".into());
+    }
+    if !redo
+        && !run(
+            repo,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                &change.after,
+                "refs/remotes",
+            ],
+        )?
+        .is_empty()
+    {
+        return Err("This commit is contained in a remote-tracking branch; undo would rewrite published history".into());
+    }
+    run(
+        repo,
+        &[
+            "update-ref",
+            "-m",
+            &format!("GitVibe {action}"),
+            &format!("refs/heads/{}", change.branch),
+            target,
+            expected,
+        ],
+    )?;
+    Ok(format!("{action} on {}", change.branch))
 }
 
 pub fn replay_index_change(
@@ -933,7 +1033,7 @@ pub fn discard_hunk(repo: &Path, patch: &str) -> Result<(), String> {
     if diff_hunks(patch).len() != 1 {
         return Err("Expected a single text hunk to discard".into());
     }
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("--no-pager")
         .arg("-C")
         .arg(repo)
@@ -958,7 +1058,7 @@ pub fn discard_hunk(repo: &Path, patch: &str) -> Result<(), String> {
 }
 
 fn apply_patch(repo: &Path, patch: &str, reverse: bool, zero_context: bool) -> Result<(), String> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.arg("--no-pager").arg("-C").arg(repo).arg("apply");
     if reverse {
         command.arg("--reverse");
@@ -987,8 +1087,18 @@ fn apply_patch(repo: &Path, patch: &str, reverse: bool, zero_context: bool) -> R
     }
 }
 
-fn git_output(repo: Option<&Path>, args: &[&str]) -> Result<Output, String> {
+fn git_command() -> Command {
     let mut command = Command::new("git");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command
+}
+
+fn git_output(repo: Option<&Path>, args: &[&str]) -> Result<Output, String> {
+    let mut command = git_command();
     command.arg("--no-pager");
     if let Some(repo) = repo {
         command.arg("-C").arg(repo);
@@ -1487,7 +1597,7 @@ pub fn start_interactive_rebase(repo: &Path, plan: &RebasePlan) -> Result<String
         shell_quote_path(&executable),
         shell_quote_path(&todo_path)
     );
-    let output = Command::new("git")
+    let output = git_command()
         .arg("--no-pager")
         .arg("-C")
         .arg(repo)
@@ -1529,7 +1639,7 @@ pub fn run_helper_command() -> Option<i32> {
         }
     } else if command == "--amend-rebase-message" {
         match (arguments.next(), arguments.next()) {
-            (Some(message), None) => Command::new("git")
+            (Some(message), None) => git_command()
                 .args(["commit", "--amend", "-F"])
                 .arg(message)
                 .output()
@@ -1640,7 +1750,7 @@ pub fn search_history(repo: &Path, query: &str) -> Result<(Vec<Commit>, bool), S
     if run(repo, &["rev-parse", "--verify", "HEAD"]).is_err() {
         return Ok((Vec::new(), false));
     }
-    let mut child = Command::new("git")
+    let mut child = git_command()
         .arg("--no-pager")
         .arg("-C")
         .arg(repo)
@@ -2842,6 +2952,65 @@ mod tests {
                 .iter()
                 .any(|file| file.path == "two.txt" && file.staged())
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replays_unpublished_commit_without_touching_working_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gitvibe-commit-undo-{}-{unique}",
+            std::process::id()
+        ));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        std::fs::write(root.join("file.txt"), "base\n").unwrap();
+        run(&root, &["add", "file.txt"]).unwrap();
+        run(&root, &["commit", "-m", "Base"]).unwrap();
+        let before = run(&root, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(root.join("file.txt"), "committed\n").unwrap();
+        run(&root, &["add", "file.txt"]).unwrap();
+        let (_, change) =
+            with_commit_history(&root, || run(&root, &["commit", "-m", "New"])).unwrap();
+        let change = change.expect("ordinary commit should have recovery data");
+        assert_eq!(run(&root, &["rev-parse", "HEAD"]).unwrap(), change.after);
+        std::fs::write(root.join("file.txt"), "later working edit\n").unwrap();
+        replay_commit_change(&root, &change, false).unwrap();
+        assert_eq!(run(&root, &["rev-parse", "HEAD"]).unwrap(), before);
+        assert!(snapshot(&root).unwrap().status[0].staged());
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "later working edit\n"
+        );
+        replay_commit_change(&root, &change, true).unwrap();
+        assert_eq!(run(&root, &["rev-parse", "HEAD"]).unwrap(), change.after);
+        assert_eq!(
+            std::fs::read_to_string(root.join("file.txt")).unwrap(),
+            "later working edit\n"
+        );
+        run(
+            &root,
+            &["update-ref", "refs/remotes/origin/test", &change.after],
+        )
+        .unwrap();
+        assert!(
+            replay_commit_change(&root, &change, false)
+                .unwrap_err()
+                .contains("remote-tracking")
+        );
+        run(&root, &["update-ref", "-d", "refs/remotes/origin/test"]).unwrap();
+        std::fs::write(root.join("other.txt"), "other\n").unwrap();
+        run(&root, &["add", "other.txt"]).unwrap();
+        assert!(
+            replay_commit_change(&root, &change, false)
+                .unwrap_err()
+                .contains("index changed")
+        );
+        assert_eq!(run(&root, &["rev-parse", "HEAD"]).unwrap(), change.after);
         std::fs::remove_dir_all(root).unwrap();
     }
 
