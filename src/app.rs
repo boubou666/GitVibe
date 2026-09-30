@@ -4130,25 +4130,59 @@ impl GitVibe {
             egui::pos2(rect.right() - 42.0, rect.center().y),
             egui::vec2(72.0, 23.0),
         );
-        ui.painter()
-            .with_clip_rect(egui::Rect::from_min_max(
-                egui::pos2(rect.left() + 29.0, rect.top()),
-                egui::pos2(
-                    if show_stage {
-                        stage_rect.left() - 5.0
-                    } else {
-                        rect.right() - 8.0
-                    },
-                    rect.bottom(),
-                ),
-            ))
-            .text(
-                egui::pos2(rect.left() + 29.0, rect.center().y),
+        let path_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.left() + 29.0, rect.top()),
+            egui::pos2(
+                if show_stage {
+                    stage_rect.left() - 5.0
+                } else {
+                    rect.right() - 8.0
+                },
+                rect.bottom(),
+            ),
+        );
+        let font = egui::FontId::proportional(12.0);
+        let truncated = ui
+            .painter()
+            .layout_no_wrap(file.path.clone(), font.clone(), text())
+            .size()
+            .x
+            > path_rect.width();
+        let visible_rect = if truncated {
+            egui::Rect::from_min_max(
+                path_rect.min,
+                egui::pos2(path_rect.right() - 10.0, path_rect.bottom()),
+            )
+        } else {
+            path_rect
+        };
+        ui.painter().with_clip_rect(visible_rect).text(
+            egui::pos2(path_rect.left(), rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &file.path,
+            font.clone(),
+            text(),
+        );
+        if truncated {
+            ui.painter().text(
+                egui::pos2(path_rect.right() - 10.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
-                &file.path,
-                egui::FontId::proportional(12.0),
+                "…",
+                font,
                 text(),
             );
+        }
+        if truncated
+            && row_hovered
+            && ui.input(|input| {
+                input
+                    .pointer
+                    .hover_pos()
+                    .is_some_and(|position| path_rect.contains(position))
+            })
+        {
+            response.clone().on_hover_text(&file.path);
+        }
         let stage_clicked = show_stage
             && ui
                 .put(
