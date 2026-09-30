@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "gitvibe"
-version = "0.19.3"
+version = "0.19.4"
 dependencies = [
  "eframe",
  "rfd",

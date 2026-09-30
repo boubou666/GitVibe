@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-09-30
+
+### Fixed
+
+- Keep every sidebar page reachable in short windows by scrolling the page links separately from the branch tree.
+
 ## [0.19.3] - 2026-09-30
 
 ### Fixed
@@ -250,7 +256,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.19.3...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.19.4...HEAD
+[0.19.4]: https://github.com/boubou666/GitVibe/compare/v0.19.3...v0.19.4
 [0.19.3]: https://github.com/boubou666/GitVibe/compare/v0.19.2...v0.19.3
 [0.19.2]: https://github.com/boubou666/GitVibe/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/boubou666/GitVibe/compare/v0.19.0...v0.19.1
