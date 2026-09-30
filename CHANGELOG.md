@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-30
+
+### Added
+
+- Undo and redo for recent staging and unstaging actions, including files, hunks, lines, and binary files. The toolbar and command palette show the action scope, and Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z work outside text fields.
+- Safety checks before replaying a staging action: the repository, branch, HEAD, and index must still match the recorded state. Working files are never rewritten by this undo path.
+
 ## [0.10.0] - 2026-09-30
 
 ### Added

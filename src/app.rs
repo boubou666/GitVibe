@@ -181,6 +181,8 @@ enum PaletteAction {
     UnstageSelected,
     StageAll,
     UnstageAll,
+    UndoIndex,
+    RedoIndex,
 }
 
 impl PaletteAction {
@@ -202,6 +204,8 @@ impl PaletteAction {
                 | Self::UnstageSelected
                 | Self::StageAll
                 | Self::UnstageAll
+                | Self::UndoIndex
+                | Self::RedoIndex
         )
     }
 }
@@ -232,6 +236,11 @@ const PALETTE_ACTIONS: &[(&str, PaletteAction)] = &[
     ),
     ("Stage all changes", PaletteAction::StageAll),
     ("Unstage all changes", PaletteAction::UnstageAll),
+    ("Undo staging change · Ctrl/Cmd+Z", PaletteAction::UndoIndex),
+    (
+        "Redo staging change · Ctrl/Cmd+Shift+Z",
+        PaletteAction::RedoIndex,
+    ),
     ("Refresh repository", PaletteAction::Refresh),
     ("Fetch all", PaletteAction::Fetch),
     ("Pull", PaletteAction::Pull),
@@ -304,6 +313,7 @@ enum Job {
     Init(PathBuf),
     Clone(String, PathBuf, bool, bool),
     Run(Vec<String>),
+    UndoIndex(git::IndexChange, bool),
     SwitchBranch(String, bool, bool),
     Shell(String, PathBuf),
     LoadPullRequests,
@@ -336,6 +346,8 @@ enum Done {
     Loaded(Result<Snapshot, String>),
     Ran(Result<(String, Snapshot), String>),
     RanFailed(String, Snapshot),
+    IndexChanged(String, Snapshot, Option<git::IndexChange>),
+    IndexMoved(String, Snapshot, git::IndexChange, bool),
     Shell(Result<String, String>),
     PullRequests(Result<Vec<github::PullRequest>, String>),
     PullRequestCreated(Result<String, String>),
@@ -346,6 +358,28 @@ enum Done {
     FileHistory(String, Result<Vec<git::Commit>, String>),
     ConflictLoaded(Result<git::ConflictDocument, String>),
     InteractiveRebaseLoaded(Result<git::RebasePlan, String>),
+}
+
+fn finish_index_job<F>(
+    repo: Option<PathBuf>,
+    history_limit: usize,
+    label: &str,
+    operation: F,
+) -> Done
+where
+    F: FnOnce(&Path) -> Result<String, String>,
+{
+    let Some(path) = repo else {
+        return Done::Ran(Err("No repository selected".into()));
+    };
+    let result = git::with_index_history(&path, label, || operation(&path));
+    match git::snapshot_with_limit(&path, history_limit) {
+        Ok(snapshot) => match result {
+            Ok((output, change)) => Done::IndexChanged(output, snapshot, change),
+            Err(error) => Done::RanFailed(error, snapshot),
+        },
+        Err(error) => Done::Ran(Err(error)),
+    }
 }
 
 pub struct GitVibe {
@@ -419,6 +453,8 @@ pub struct GitVibe {
     palette_index: usize,
     palette_focus: bool,
     graph_scroll_pending: bool,
+    undo_stack: Vec<git::IndexChange>,
+    redo_stack: Vec<git::IndexChange>,
     search_results: Vec<git::Commit>,
     search_more: bool,
     search_active: bool,
@@ -638,6 +674,8 @@ impl GitVibe {
             palette_index: 0,
             palette_focus: false,
             graph_scroll_pending: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             search_results: Vec::new(),
             search_more: false,
             search_active: false,
@@ -792,6 +830,14 @@ impl GitVibe {
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| git::snapshot_with_limit(&p, history_limit)),
                 ),
+                Job::Run(args) if git::is_index_mutation(&args) => {
+                    let label = if args.first().is_some_and(|arg| arg == "add") {
+                        "Stage changes"
+                    } else {
+                        "Unstage changes"
+                    };
+                    finish_index_job(repo, history_limit, label, |path| git::run_owned(path, &args))
+                }
                 Job::Run(args) => match repo {
                     Some(p) => {
                         let operation = git::run_owned(&p, &args);
@@ -805,6 +851,19 @@ impl GitVibe {
                                     Err(error) => Done::RanFailed(error, snapshot),
                                 }
                             }
+                            Err(error) => Done::Ran(Err(error)),
+                        }
+                    }
+                    None => Done::Ran(Err("No repository selected".to_owned())),
+                },
+                Job::UndoIndex(change, redo) => match repo {
+                    Some(path) => {
+                        let operation = git::replay_index_change(&path, &change, redo);
+                        match git::snapshot_with_limit(&path, history_limit) {
+                            Ok(snapshot) => match operation {
+                                Ok(output) => Done::IndexMoved(output, snapshot, change, redo),
+                                Err(error) => Done::RanFailed(error, snapshot),
+                            },
                             Err(error) => Done::Ran(Err(error)),
                         }
                     }
@@ -874,21 +933,13 @@ impl GitVibe {
                             Ok(format!("Conflict in {path}\n\n{preview}"))
                         }),
                 ),
-                Job::ApplyHunk(patch, reverse) => Done::Ran(
-                    repo.ok_or("No repository selected".to_owned())
-                        .and_then(|p| {
-                            git::apply_hunk(&p, &patch, reverse)?;
-                            let snapshot = git::snapshot_with_limit(&p, history_limit)?;
-                            Ok((
-                                if reverse {
-                                    "Hunk unstaged".to_owned()
-                                } else {
-                                    "Hunk staged".to_owned()
-                                },
-                                snapshot,
-                            ))
-                        }),
-                ),
+                Job::ApplyHunk(patch, reverse) => {
+                    let label = if reverse { "Unstage hunk" } else { "Stage hunk" };
+                    finish_index_job(repo, history_limit, label, |path| {
+                        git::apply_hunk(path, &patch, reverse)?;
+                        Ok(label.to_owned())
+                    })
+                }
                 Job::DiscardHunk(patch) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|path| {
                         git::discard_hunk(&path, &patch)?;
@@ -896,13 +947,13 @@ impl GitVibe {
                         Ok(("Hunk discarded".to_owned(), snapshot))
                     }),
                 ),
-                Job::ApplyLine(patch, reverse) => Done::Ran(
-                    repo.ok_or("No repository selected".to_owned()).and_then(|p| {
-                        git::apply_line(&p, &patch, reverse)?;
-                        let snapshot = git::snapshot_with_limit(&p, history_limit)?;
-                        Ok((if reverse { "Line unstaged" } else { "Line staged" }.to_owned(), snapshot))
-                    }),
-                ),
+                Job::ApplyLine(patch, reverse) => {
+                    let label = if reverse { "Unstage line" } else { "Stage line" };
+                    finish_index_job(repo, history_limit, label, |path| {
+                        git::apply_line(path, &patch, reverse)?;
+                        Ok(label.to_owned())
+                    })
+                }
                 Job::SearchHistory(query) => Done::Searched(
                     repo.ok_or("No repository selected".to_owned())
                         .and_then(|p| git::search_history(&p, &query)),
@@ -953,10 +1004,41 @@ impl GitVibe {
         };
         self.receiver = None;
         self.busy = false;
+        let mut keep_index_history = false;
+        let done = match done {
+            Done::IndexChanged(output, snapshot, change) => {
+                if let Some(change) = change {
+                    self.undo_stack.push(change);
+                    if self.undo_stack.len() > 20 {
+                        self.undo_stack.remove(0);
+                    }
+                    self.redo_stack.clear();
+                    keep_index_history = true;
+                } else {
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
+                }
+                Done::Ran(Ok((output, snapshot)))
+            }
+            Done::IndexMoved(output, snapshot, change, redo) => {
+                if redo {
+                    self.redo_stack.pop();
+                    self.undo_stack.push(change);
+                } else {
+                    self.undo_stack.pop();
+                    self.redo_stack.push(change);
+                }
+                keep_index_history = true;
+                Done::Ran(Ok((output, snapshot)))
+            }
+            other => other,
+        };
         match done {
             Done::Loaded(result) => match result {
                 Ok(snapshot) => {
                     if self.repo.as_ref() != Some(&snapshot.root) {
+                        self.undo_stack.clear();
+                        self.redo_stack.clear();
                         self.terminal_cwd = Some(snapshot.root.clone());
                         self.terminal_output.clear();
                         self.selected_commit = None;
@@ -1001,6 +1083,10 @@ impl GitVibe {
             },
             Done::Ran(result) => match result {
                 Ok((output, snapshot)) => {
+                    if !keep_index_history {
+                        self.undo_stack.clear();
+                        self.redo_stack.clear();
+                    }
                     let branch_changed = self
                         .snapshot
                         .as_ref()
@@ -1074,6 +1160,8 @@ impl GitVibe {
                     self.conflict_action = false;
                 }
                 Err(error) => {
+                    self.undo_stack.clear();
+                    self.redo_stack.clear();
                     self.error = error;
                     self.committing = false;
                     self.hunk_action = false;
@@ -1081,6 +1169,8 @@ impl GitVibe {
                 }
             },
             Done::RanFailed(error, snapshot) => {
+                self.undo_stack.clear();
+                self.redo_stack.clear();
                 self.repo = Some(snapshot.root.clone());
                 self.snapshot = Some(snapshot);
                 self.interactive_plan = None;
@@ -1180,6 +1270,7 @@ impl GitVibe {
                 }
                 Err(error) => self.error = error,
             },
+            Done::IndexChanged(..) | Done::IndexMoved(..) => unreachable!(),
         }
     }
 
@@ -1283,12 +1374,34 @@ impl GitVibe {
                     .color(if count == 0 { accent() } else { orange() }),
                 );
             }
-            let toolbar_width = 555.0;
+            let toolbar_width = 665.0;
             ui.add_space(
                 (ui.max_rect().center().x - ui.cursor().left() - toolbar_width / 2.0).max(8.0),
             );
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(self.repo.is_some() && !self.busy, |ui| {
+                    let undo = ui
+                        .add_enabled(!self.undo_stack.is_empty(), egui::Button::new("Undo"))
+                        .on_hover_text(format!(
+                            "Undo staging change only: {}",
+                            self.undo_stack
+                                .last()
+                                .map_or("none", |change| change.label.as_str())
+                        ));
+                    if undo.clicked() {
+                        self.undo_index(false);
+                    }
+                    let redo = ui
+                        .add_enabled(!self.redo_stack.is_empty(), egui::Button::new("Redo"))
+                        .on_hover_text(format!(
+                            "Redo staging change only: {}",
+                            self.redo_stack
+                                .last()
+                                .map_or("none", |change| change.label.as_str())
+                        ));
+                    if redo.clicked() {
+                        self.undo_index(true);
+                    }
                     if toolbar_action(ui, "Fetch") {
                         self.git(&["fetch", "--all", "--prune"]);
                     }
@@ -1358,6 +1471,17 @@ impl GitVibe {
         }
     }
 
+    fn undo_index(&mut self, redo: bool) {
+        let change = if redo {
+            self.redo_stack.last()
+        } else {
+            self.undo_stack.last()
+        };
+        if let Some(change) = change.cloned() {
+            self.queue(Job::UndoIndex(change, redo));
+        }
+    }
+
     fn open_palette(&mut self) {
         self.palette_open = true;
         self.palette_query.clear();
@@ -1424,6 +1548,8 @@ impl GitVibe {
                     self.git(&["restore", "--staged", "."]);
                 }
             }
+            PaletteAction::UndoIndex => self.undo_index(false),
+            PaletteAction::RedoIndex => self.undo_index(true),
         }
     }
 
@@ -1474,6 +1600,8 @@ impl GitVibe {
                                         snapshot.status.iter().any(git::FileStatus::staged)
                                     })
                                 }
+                                PaletteAction::UndoIndex => !self.undo_stack.is_empty(),
+                                PaletteAction::RedoIndex => !self.redo_stack.is_empty(),
                                 _ => true,
                             }
                             && label.to_lowercase().contains(&query)
@@ -5867,6 +5995,15 @@ impl eframe::App for GitVibe {
         }
         if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::K)) {
             self.open_palette();
+        }
+        if !self.palette_open && !self.busy && !ctx.text_edit_focused() {
+            let index_shortcut = ctx.input(|input| {
+                (input.modifiers.command && input.key_pressed(egui::Key::Z))
+                    .then_some(input.modifiers.shift)
+            });
+            if let Some(redo) = index_shortcut {
+                self.undo_index(redo);
+            }
         }
         if self.page == Page::Changes
             && !self.palette_open
