@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-30
+
+### Added
+
+- Restore a file from a selected commit into the working tree and staging area. GitVibe refuses when the file has local changes, so they cannot be silently overwritten.
+- Load a repository's configured Git commit template into an empty commit draft, with an explicit Apply template control. Template comment lines are removed before use.
+- Add a co-author name and email to append a validated `Co-authored-by` trailer when committing.
+
 ## [0.14.0] - 2026-09-30
 
 ### Added
@@ -164,7 +172,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fetch, pull, push, and an integrated Git command console.
 - Background Git operations and unit tests for status and command parsing.
 
-[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/boubou666/GitVibe/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/boubou666/GitVibe/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/boubou666/GitVibe/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/boubou666/GitVibe/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/boubou666/GitVibe/compare/v0.11.0...v0.12.0
