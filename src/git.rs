@@ -88,6 +88,84 @@ pub struct IndexChange {
     pub label: String,
 }
 
+#[derive(Clone)]
+pub struct MergeCheck {
+    pub target: String,
+    pub head: String,
+    pub target_id: String,
+    pub conflicts: Vec<String>,
+    pub clean: bool,
+}
+
+pub fn check_merge_target(repo: &Path, target: &str) -> Result<MergeCheck, String> {
+    if target.is_empty() || target.starts_with('-') {
+        return Err("Choose a valid target branch".into());
+    }
+    let head = run(repo, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let target_id = run(
+        repo,
+        &["rev-parse", "--verify", &format!("{target}^{{commit}}")],
+    )?;
+    if head == target_id {
+        return Ok(MergeCheck {
+            target: target.into(),
+            head,
+            target_id,
+            conflicts: Vec::new(),
+            clean: true,
+        });
+    }
+    let output = git_output(
+        Some(repo),
+        &["merge-tree", "--write-tree", "--quiet", &head, &target_id],
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(MergeCheck {
+            target: target.into(),
+            head,
+            target_id,
+            conflicts: Vec::new(),
+            clean: true,
+        }),
+        Some(1) => {
+            let details = git_output(
+                Some(repo),
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    "--name-only",
+                    "--no-messages",
+                    &head,
+                    &target_id,
+                ],
+            )?;
+            if details.status.code() != Some(1) {
+                return Err(format!(
+                    "Could not list conflicting files: {}",
+                    String::from_utf8_lossy(&details.stderr).trim()
+                ));
+            }
+            let conflicts = String::from_utf8_lossy(&details.stdout)
+                .lines()
+                .skip(1)
+                .filter(|path| !path.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Ok(MergeCheck {
+                target: target.into(),
+                head,
+                target_id,
+                conflicts,
+                clean: false,
+            })
+        }
+        _ => Err(format!(
+            "Could not check merge conflicts: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+    }
+}
+
 struct IndexState {
     head: String,
     branch: String,
@@ -2465,6 +2543,54 @@ mod tests {
         assert_eq!(std::fs::read(root.join("binary.dat")).unwrap(), bytes);
         replay_index_change(&root, &change, true).unwrap();
         assert!(snapshot(&root).unwrap().status[0].staged());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checks_target_merges_without_changing_repository_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gitvibe-merge-check-{}-{unique}",
+            std::process::id()
+        ));
+        let root = init(&root).unwrap();
+        run(&root, &["config", "user.name", "GitVibe Test"]).unwrap();
+        run(&root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        std::fs::write(root.join("shared.txt"), "base\n").unwrap();
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-m", "Base"]).unwrap();
+        let original_branch = run(&root, &["branch", "--show-current"]).unwrap();
+        run(&root, &["switch", "-c", "topic"]).unwrap();
+        std::fs::write(root.join("topic.txt"), "topic\n").unwrap();
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-m", "Topic"]).unwrap();
+        run(&root, &["switch", &original_branch]).unwrap();
+        std::fs::write(root.join("main.txt"), "main\n").unwrap();
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-m", "Main"]).unwrap();
+        assert!(check_merge_target(&root, "topic").unwrap().clean);
+        run(&root, &["switch", "topic"]).unwrap();
+        std::fs::write(root.join("shared.txt"), "topic edit\n").unwrap();
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-m", "Topic edit"]).unwrap();
+        run(&root, &["switch", &original_branch]).unwrap();
+        std::fs::write(root.join("shared.txt"), "main edit\n").unwrap();
+        run(&root, &["add", "."]).unwrap();
+        run(&root, &["commit", "-m", "Main edit"]).unwrap();
+        let head = run(&root, &["rev-parse", "HEAD"]).unwrap();
+        let check = check_merge_target(&root, "topic").unwrap();
+        assert!(!check.clean);
+        assert!(
+            check
+                .conflicts
+                .iter()
+                .any(|path| path.contains("shared.txt"))
+        );
+        assert_eq!(run(&root, &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(run(&root, &["status", "--porcelain"]).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

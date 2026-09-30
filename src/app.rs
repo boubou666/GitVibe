@@ -318,6 +318,7 @@ enum Job {
     Clone(String, PathBuf, bool, bool),
     Run(Vec<String>),
     UndoIndex(git::IndexChange, bool),
+    CheckMergeTarget(String),
     SwitchBranch(String, bool, bool),
     Shell(String, PathBuf),
     LoadPullRequests,
@@ -352,6 +353,7 @@ enum Done {
     RanFailed(String, Snapshot),
     IndexChanged(String, Snapshot, Option<git::IndexChange>),
     IndexMoved(String, Snapshot, git::IndexChange, bool),
+    MergeChecked(Result<git::MergeCheck, String>),
     Shell(Result<String, String>),
     PullRequests(Result<Vec<github::PullRequest>, String>),
     PullRequestCreated(Result<String, String>),
@@ -396,6 +398,9 @@ pub struct GitVibe {
     pinned_repos: Vec<PathBuf>,
     repo_filter: String,
     branch_filter: String,
+    merge_targets: HashMap<PathBuf, String>,
+    merge_check: Option<git::MergeCheck>,
+    merge_check_error: String,
     theme_choice: ThemeChoice,
     pull_mode: PullMode,
     snapshot: Option<Snapshot>,
@@ -533,6 +538,12 @@ impl GitVibe {
             .storage
             .and_then(|storage| eframe::get_value::<PullMode>(storage, "pull_mode"))
             .unwrap_or(PullMode::Merge);
+        let merge_targets = cc
+            .storage
+            .and_then(|storage| {
+                eframe::get_value::<HashMap<PathBuf, String>>(storage, "merge_targets")
+            })
+            .unwrap_or_default();
         PALETTE.with(|palette| palette.set(Palette::for_choice(theme_choice)));
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(text());
@@ -619,6 +630,9 @@ impl GitVibe {
             pinned_repos,
             repo_filter: String::new(),
             branch_filter: String::new(),
+            merge_targets,
+            merge_check: None,
+            merge_check_error: String::new(),
             theme_choice,
             pull_mode,
             snapshot: None,
@@ -877,6 +891,10 @@ impl GitVibe {
                     }
                     None => Done::Ran(Err("No repository selected".to_owned())),
                 },
+                Job::CheckMergeTarget(target) => Done::MergeChecked(
+                    repo.ok_or("No repository selected".to_owned())
+                        .and_then(|path| git::check_merge_target(&path, &target)),
+                ),
                 Job::SwitchBranch(name, stash_first, remote) => Done::Ran(
                     repo.ok_or("No repository selected".to_owned()).and_then(|p| {
                         let mut output = String::new();
@@ -1044,6 +1062,8 @@ impl GitVibe {
         match done {
             Done::Loaded(result) => match result {
                 Ok(snapshot) => {
+                    self.merge_check = None;
+                    self.merge_check_error.clear();
                     if self.repo.as_ref() != Some(&snapshot.root) {
                         self.undo_stack.clear();
                         self.redo_stack.clear();
@@ -1091,6 +1111,8 @@ impl GitVibe {
             },
             Done::Ran(result) => match result {
                 Ok((output, snapshot)) => {
+                    self.merge_check = None;
+                    self.merge_check_error.clear();
                     if !keep_index_history {
                         self.undo_stack.clear();
                         self.redo_stack.clear();
@@ -1168,6 +1190,7 @@ impl GitVibe {
                     self.conflict_action = false;
                 }
                 Err(error) => {
+                    self.merge_check = None;
                     self.undo_stack.clear();
                     self.redo_stack.clear();
                     self.error = error;
@@ -1177,6 +1200,7 @@ impl GitVibe {
                 }
             },
             Done::RanFailed(error, snapshot) => {
+                self.merge_check = None;
                 self.undo_stack.clear();
                 self.redo_stack.clear();
                 self.repo = Some(snapshot.root.clone());
@@ -1278,8 +1302,45 @@ impl GitVibe {
                 }
                 Err(error) => self.error = error,
             },
+            Done::MergeChecked(result) => match result {
+                Ok(check) => {
+                    self.merge_check = Some(check);
+                    self.merge_check_error.clear();
+                }
+                Err(error) => {
+                    self.merge_check = None;
+                    self.merge_check_error = error.clone();
+                    self.error = error;
+                }
+            },
             Done::IndexChanged(..) | Done::IndexMoved(..) => unreachable!(),
         }
+    }
+
+    fn merge_target_for(&self, snapshot: &Snapshot) -> Option<String> {
+        if let Some(saved) = self.merge_targets.get(&snapshot.root) {
+            return Some(saved.clone());
+        }
+        for candidate in ["origin/main", "origin/master", "origin/HEAD"] {
+            if snapshot
+                .remote_branches
+                .iter()
+                .any(|branch| branch.name == candidate)
+            {
+                return Some(candidate.into());
+            }
+        }
+        for candidate in ["main", "master"] {
+            if snapshot.branch != candidate
+                && snapshot
+                    .branches
+                    .iter()
+                    .any(|branch| branch.name == candidate)
+            {
+                return Some(candidate.into());
+            }
+        }
+        None
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
@@ -1304,6 +1365,12 @@ impl GitVibe {
             .as_ref()
             .map(|snapshot| snapshot.branches.clone())
             .unwrap_or_default();
+        let merge_snapshot = self.snapshot.clone();
+        let merge_target = merge_snapshot
+            .as_ref()
+            .and_then(|snapshot| self.merge_target_for(snapshot));
+        let merge_check = self.merge_check.clone();
+        let merge_check_error = self.merge_check_error.clone();
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("repository").size(10.0).color(muted()));
@@ -1369,6 +1436,123 @@ impl GitVibe {
                         }
                     });
                 });
+            }
+            if let Some(snapshot) = &merge_snapshot
+                && !snapshot.branch.is_empty()
+            {
+                ui.add_space(5.0);
+                let indicator = match &merge_check {
+                    Some(check) if check.target == merge_target.clone().unwrap_or_default() => {
+                        if check.clean {
+                            accent()
+                        } else {
+                            red()
+                        }
+                    }
+                    _ => muted(),
+                };
+                let menu = ui.menu_button(RichText::new("◇").size(19.0).color(indicator), |ui| {
+                    ui.set_min_width(330.0);
+                    ui.label(RichText::new("MERGE TARGET CHECK").strong().color(text()));
+                    ui.label(
+                        RichText::new(
+                            "Checks committed branch tips; uncommitted edits are excluded.",
+                        )
+                        .small()
+                        .color(muted()),
+                    );
+                    ui.separator();
+                    if let Some(target) = &merge_target {
+                        ui.label(format!("{} → {target}", snapshot.branch));
+                    } else {
+                        ui.label("Choose a target branch to check.");
+                    }
+                    ui.menu_button("Target branch", |ui| {
+                        for option in snapshot
+                            .remote_branches
+                            .iter()
+                            .chain(snapshot.branches.iter())
+                            .filter(|branch| {
+                                branch.name != snapshot.branch && !branch.name.ends_with("/HEAD")
+                            })
+                        {
+                            if ui
+                                .selectable_label(
+                                    merge_target.as_deref() == Some(&option.name),
+                                    &option.name,
+                                )
+                                .clicked()
+                            {
+                                self.merge_targets
+                                    .insert(snapshot.root.clone(), option.name.clone());
+                                self.merge_check = None;
+                                self.merge_check_error.clear();
+                                ui.close();
+                            }
+                        }
+                    });
+                    if let Some(check) = &merge_check
+                        && merge_target.as_deref() == Some(&check.target)
+                    {
+                        ui.separator();
+                        if check.clean {
+                            ui.label(RichText::new("No merge conflicts detected").color(accent()));
+                        } else {
+                            ui.label(RichText::new("Merge conflicts detected").color(red()));
+                            for path in check.conflicts.iter().take(12) {
+                                ui.label(RichText::new(path).small().color(text()));
+                            }
+                            if check.conflicts.len() > 12 {
+                                ui.label(format!("+{} more files", check.conflicts.len() - 12));
+                            }
+                            if ui.button("Open rebase tools").clicked() {
+                                self.rebase_onto = check.target.clone();
+                                self.page = Page::Rebase;
+                                ui.close();
+                            }
+                        }
+                        ui.label(
+                            RichText::new(format!(
+                                "At {} against {}",
+                                &check.head[..check.head.len().min(7)],
+                                &check.target_id[..check.target_id.len().min(7)]
+                            ))
+                            .small()
+                            .color(muted()),
+                        );
+                    }
+                    if !merge_check_error.is_empty() {
+                        ui.label(RichText::new(&merge_check_error).color(red()));
+                    }
+                    if let Some(target) = &merge_target
+                        && ui
+                            .add_enabled(!self.busy, egui::Button::new("Check again"))
+                            .clicked()
+                    {
+                        self.queue(Job::CheckMergeTarget(target.clone()));
+                    }
+                });
+                menu.response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        "Check target branch for merge conflicts",
+                    )
+                });
+                menu.response.clone().on_hover_text(match &merge_check {
+                    Some(check) if check.clean => {
+                        format!("No conflicts detected against {}", check.target)
+                    }
+                    Some(check) => format!("Conflicts detected against {}", check.target),
+                    None => "Check the current branch against its merge target".into(),
+                });
+                if menu.response.clicked()
+                    && merge_check.is_none()
+                    && !self.busy
+                    && let Some(target) = merge_target
+                {
+                    self.queue(Job::CheckMergeTarget(target));
+                }
             }
             if let Some(count) = changed {
                 ui.add_space(6.0);
@@ -6034,6 +6218,7 @@ impl eframe::App for GitVibe {
         eframe::set_value(storage, "changelog_open", &self.changelog_open);
         eframe::set_value(storage, "theme_choice", &self.theme_choice);
         eframe::set_value(storage, "pull_mode", &self.pull_mode);
+        eframe::set_value(storage, "merge_targets", &self.merge_targets);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

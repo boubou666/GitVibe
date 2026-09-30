@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-30
+
+### Added
+
+- A merge-target status control beside the branch picker. It checks committed branch tips with Git's read-only merge simulation, reports conflicts and affected paths, and offers a route to rebase tools.
+- A per-repository target-branch choice, with common main and master defaults, saved between launches. The control states that uncommitted edits are excluded from the check.
+
 ## [0.12.0] - 2026-09-30
 
 ### Added
