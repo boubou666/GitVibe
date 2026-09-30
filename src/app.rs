@@ -6319,19 +6319,57 @@ impl GitVibe {
                                 text(),
                             );
                         }
-                        if hovered {
+                        if ui.input(|input| {
+                            input
+                                .pointer
+                                .hover_pos()
+                                .is_some_and(|position| path_rect.contains(position))
+                        }) {
                             row.clone().on_hover_text(&file.path);
                         }
-                        let restore_clicked = file.status != "D"
-                            && ui
-                                .add_enabled_ui(!self.busy, |ui| {
-                                    ui.put(restore_rect, egui::Button::new("Restore…"))
-                                })
-                                .inner
-                                .on_hover_text(
-                                    "Restore this version into the working file and stage it",
-                                )
-                                .clicked();
+                        let restore_clicked = if file.status != "D" {
+                            let restore = ui.interact(
+                                restore_rect,
+                                ui.id().with(("restore_file", &commit.id, &file.path)),
+                                egui::Sense::click(),
+                            );
+                            ui.painter().rect_filled(
+                                restore_rect,
+                                4.0,
+                                if restore.hovered() && !self.busy {
+                                    elevated()
+                                } else {
+                                    panel_alt()
+                                },
+                            );
+                            ui.painter().rect_stroke(
+                                restore_rect,
+                                4.0,
+                                Stroke::new(
+                                    1.0,
+                                    if restore.hovered() && !self.busy {
+                                        accent()
+                                    } else {
+                                        border()
+                                    },
+                                ),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                restore_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Restore…",
+                                egui::FontId::proportional(11.5),
+                                if self.busy { muted() } else { text() },
+                            );
+                            let clicked = restore.clicked() && !self.busy;
+                            restore.on_hover_text(
+                                "Restore this version into the working file and stage it",
+                            );
+                            clicked
+                        } else {
+                            false
+                        };
                         let restore_target = file.status != "D"
                             && ui.input(|input| {
                                 input
