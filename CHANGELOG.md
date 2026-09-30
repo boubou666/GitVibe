@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - File-aware syntax highlighting in working-tree and commit diffs, using separate parser state for the old and new sides of each hunk. Unknown file types keep the existing readable fallback.
 - Alt+Up and Alt+Down to select changed files without using the mouse; selection scrolls into view in the Changes panel.
-- Native AccessKit accessibility support, accessible labels for painted tabs and branch rows, and stronger muted-text contrast on the Aurora theme.
+- Native AccessKit accessibility support, accessible labels and selection state for painted tabs, branches, and commits, and stronger muted-text contrast on the Aurora theme.
 
 ## [0.11.0] - 2026-09-30
 

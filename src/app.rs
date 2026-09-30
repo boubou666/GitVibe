@@ -6723,6 +6723,17 @@ fn paint_commit_row(
         egui::vec2(ui.available_width().max(graph_width + 500.0), 27.0),
         egui::Sense::click(),
     );
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Button,
+            true,
+            selected,
+            format!(
+                "Commit {}: {}, by {} on {}",
+                commit.short, commit.subject, commit.author, commit.date
+            ),
+        )
+    });
     let painter = ui.painter();
     painter.rect_filled(
         rect,
@@ -6880,7 +6891,9 @@ fn workspace_tab(
     width: f32,
 ) -> (bool, bool) {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, title)
+    });
     let fill = if selected { bg() } else { panel_alt() };
     ui.painter().rect_filled(rect, 0.0, fill);
     ui.painter().line_segment(
@@ -6946,7 +6959,9 @@ fn sidebar_branch_row(
 ) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 25.0), egui::Sense::click());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, true, selected, label)
+    });
     if selected {
         ui.painter()
             .rect_filled(rect, 0.0, Color32::from_rgb(48, 87, 66));
