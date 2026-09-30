@@ -31,6 +31,8 @@ The visual history initially loads the most recent 300 commits across local and 
 
 Press Ctrl/Cmd+K for the command palette, Ctrl/Cmd+Tab to cycle repository tabs (add Shift to reverse direction), Ctrl/Cmd+F to search commits, and F5 to refresh. With the history graph active, Up and Down select commits. In Changes, Alt+Up and Alt+Down select changed files; Ctrl/Cmd+Shift+S stages the selected file and Ctrl/Cmd+Shift+U unstages it. Undo and Redo in the toolbar, or Ctrl/Cmd+Z and Ctrl/Cmd+Shift+Z outside text fields, replay recent staging changes only. GitVibe checks the repository, branch, commit, and index before replaying; working files are left alone. Working-tree and commit diffs apply file-aware syntax colors where the file type is recognized. Native builds enable AccessKit for assistive technology, with labeled repository tabs and branch rows.
 
+The diamond beside the branch picker checks whether the committed branch tips can merge with a chosen target. Target choices are saved per repository. The check lists conflicting files without changing the index or working tree; uncommitted edits are outside its scope.
+
 ## Download and run
 
 Git must be installed and available on `PATH` on every platform. The [Desktop builds workflow](.github/workflows/desktop.yml) compiles and tests Windows, Linux, and macOS builds and uploads platform packages for each run. Linux folder dialogs use an XDG Desktop Portal backend or Zenity.
